@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Calendar
+Comment=Month-view calendar
+Exec=cce-calendar
+Icon=cce-calendar
+Categories=Office;Calendar;
+Terminal=false
+StartupNotify=true
+StartupWMClass=cce-calendar

@@ -13,3 +13,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
+# cce-calendar-sync only: CalDAV against iCloud, credentials from the same
+# keyring service cce-mail uses.
+reqwest = { version = "0.12", features = ["blocking"] }
+roxmltree = "0.20"
+chrono-tz = "0.10"
+keyring = { version = "3", features = ["sync-secret-service"] }
+
+# The month-view app; src/bin/sync.rs adds the cce-calendar-sync helper,
+# which ccebuild discovers via cargo metadata like any other [[bin]].
+[[bin]]
+name = "cce-calendar"
+path = "src/main.rs"
+
+[[bin]]
+name = "cce-calendar-sync"
+path = "src/bin/sync.rs"

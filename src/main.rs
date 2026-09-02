@@ -2,7 +2,10 @@
 //!
 //! A 6×7 month grid on the left, a day pane on the right. Events live in
 //! `$XDG_DATA_HOME/cce/calendar/events.json` (one flat list of
-//! date/time/title records) and are saved on every mutation.
+//! date/time/title records) and are saved on every mutation. Records with a
+//! `source` are mirrored from a remote calendar by `cce-calendar-sync`
+//! (blue dot); they can be deleted here, but the next sync tick restores
+//! them — the server owns them.
 //!
 //! Keys: arrows move the selected day · PageUp/PageDown month · [/] year ·
 //! t/Home today · n/Enter new event (a leading `HH:MM` token sets the
@@ -13,8 +16,8 @@
 //! (default monday).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
+use cce_calendar::{load_records, save_records, EventRecord};
 use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
 use wayland_client::QueueHandle;
 
@@ -36,6 +39,8 @@ const SIDEBAR_BG: [f32; 4] = [0.10, 0.105, 0.12, 1.0];
 const GRID_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.06];
 const ACCENT: [f32; 4] = [0.22, 0.42, 0.85, 1.0];
 const EVENT_DOT: [f32; 4] = [0.95, 0.72, 0.30, 1.0];
+/// Dot for events mirrored from a remote calendar (`source` set).
+const SYNC_DOT: [f32; 4] = [0.42, 0.68, 0.95, 1.0];
 const ROW_SEL: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
 const TEXT: [u8; 3] = [225, 228, 232];
 const TEXT_DIM: [u8; 3] = [140, 145, 152];
@@ -48,39 +53,19 @@ enum Message {
 }
 
 /// One event on a day. `time` is (hour, minute); untimed events sort after
-/// timed ones.
+/// timed ones. `uid`/`source` ride along from synced records so a save from
+/// this app never strips what `cce-calendar-sync` wrote.
 #[derive(Clone, Debug)]
 struct Event {
     time: Option<(u32, u32)>,
     title: String,
-}
-
-/// The on-disk shape: a flat list keeps the file trivially mergeable and
-/// greppable.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct EventRecord {
-    date: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    time: Option<String>,
-    title: String,
-}
-
-fn data_path() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share")
-        })
-        .join("cce/calendar/events.json")
+    uid: Option<String>,
+    source: Option<String>,
 }
 
 fn load_events() -> BTreeMap<NaiveDate, Vec<Event>> {
     let mut map: BTreeMap<NaiveDate, Vec<Event>> = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(data_path()) else {
-        return map;
-    };
-    let records: Vec<EventRecord> = match serde_json::from_str(&text) {
+    let records = match load_records() {
         Ok(r) => r,
         Err(e) => {
             log::error!("events.json unreadable, starting empty: {e}");
@@ -92,7 +77,12 @@ fn load_events() -> BTreeMap<NaiveDate, Vec<Event>> {
             continue;
         };
         let time = rec.time.as_deref().and_then(parse_time);
-        map.entry(date).or_default().push(Event { time, title: rec.title });
+        map.entry(date).or_default().push(Event {
+            time,
+            title: rec.title,
+            uid: rec.uid,
+            source: rec.source,
+        });
     }
     for events in map.values_mut() {
         sort_events(events);
@@ -125,7 +115,7 @@ fn parse_event(raw: &str) -> Option<Event> {
         },
     };
     let title = if title.is_empty() { "(untitled)".to_string() } else { title };
-    Some(Event { time, title })
+    Some(Event { time, title, uid: None, source: None })
 }
 
 fn week_start_config() -> Weekday {
@@ -286,17 +276,12 @@ impl CalendarApp {
                     date: date.to_string(),
                     time: e.time.map(|(h, m)| format!("{h:02}:{m:02}")),
                     title: e.title.clone(),
+                    uid: e.uid.clone(),
+                    source: e.source.clone(),
                 })
             })
             .collect();
-        let path = data_path();
-        let write = || -> std::io::Result<()> {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&path, serde_json::to_string_pretty(&records).unwrap_or_default())
-        };
-        self.status = write().err().map(|e| format!("save failed: {e}"));
+        self.status = save_records(&records).err().map(|e| format!("save failed: {e}"));
     }
 
     fn commit_input(&mut self) {
@@ -468,7 +453,8 @@ impl CalendarApp {
                 pc.clip(cell, |pc| {
                     let mut y = cell.y + 24.0;
                     for e in events.iter().take(shown) {
-                        pc.circle(cell.x + 9.0, y + 6.0, 2.5, EVENT_DOT);
+                        let dot = if e.source.is_some() { SYNC_DOT } else { EVENT_DOT };
+                        pc.circle(cell.x + 9.0, y + 6.0, 2.5, dot);
                         let alpha = if in_month { TEXT } else { TEXT_DIM };
                         pc.text_with(e.title.clone(), cell.x + 15.0, y, 10.0, alpha, None,
                             Some([cell.x, cell.y, cell.x + cell.width - 4.0, cell.y + cell.height]));

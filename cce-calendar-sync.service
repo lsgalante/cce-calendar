@@ -1,0 +1,10 @@
+# One read-only CalDAV pass mirroring iCloud calendars into cce-calendar's
+# events.json (see src/bin/sync.rs). Driven by cce-calendar-sync.timer;
+# harmless to start by hand. Fails (locked keyring, no network, iCloud down)
+# exit nonzero and the timer simply tries again next tick.
+[Unit]
+Description=Mirror iCloud calendars into cce-calendar
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cce-calendar-sync

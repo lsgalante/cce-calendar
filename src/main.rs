@@ -24,6 +24,7 @@ use wayland_client::QueueHandle;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{AlignH, AlignV, DisplayList, PaintCtx, TextAttrs, TextLayout};
+use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, ScrollPhase};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 
 const HEADER_H: f32 = 46.0;
@@ -32,6 +33,8 @@ const SIDEBAR_W: f32 = 300.0;
 const PAD: f32 = 12.0;
 const ROW_H: f32 = 36.0;
 const INPUT_H: f32 = 40.0;
+/// Trackpad travel per month step over the grid (a wheel notch is one step).
+const MONTH_STEP_PX: f32 = 48.0;
 
 const BG: [f32; 4] = [0.075, 0.08, 0.09, 1.0];
 const BG_OTHER_MONTH: [f32; 4] = [0.06, 0.064, 0.072, 1.0];
@@ -190,6 +193,14 @@ struct CalendarApp {
     today: NaiveDate,
     win: (f32, f32),
     sidebar_scroll: f32,
+    /// Drives `sidebar_scroll` (the drawn value) from the wheel: notches
+    /// glide, fingers track 1:1 and fling on the lift. `select` resets the
+    /// offset directly; the motion adopts that through `reconcile`.
+    sidebar_motion: ScrollMotion,
+    /// Trackpad pixels accumulated toward the next month step over the grid,
+    /// so a gesture flips one month per MONTH_STEP_PX rather than one per
+    /// pixel event. Cleared by a wheel notch and by the finger lift.
+    month_wheel_px: f32,
     status: Option<String>,
 }
 
@@ -244,6 +255,26 @@ impl CalendarApp {
         if (date.year(), date.month()) != self.view {
             self.view = (date.year(), date.month());
         }
+    }
+
+    /// How far the selected day's event rows overflow the sidebar's list area.
+    fn sidebar_overflow(&self, g: &Geom) -> f32 {
+        let events = self.events.get(&self.selected).map_or(0, Vec::len);
+        (events as f32 * ROW_H - (g.sidebar.height - 58.0 - INPUT_H - 8.0)).max(0.0)
+    }
+
+    /// Per-frame sidebar glide/coast; true while `sidebar_scroll` is still
+    /// moving, so the frame loop keeps drawing.
+    fn tick_sidebar_scroll(&mut self, dt: f32) -> bool {
+        self.sidebar_motion.reconcile(0.0, self.sidebar_scroll);
+        if !self.sidebar_motion.is_animating() {
+            return false;
+        }
+        let g = self.geom();
+        let overflow = self.sidebar_overflow(&g);
+        let moved = self.sidebar_motion.tick(dt, Bounds::max(0.0), Bounds::max(overflow));
+        self.sidebar_scroll = self.sidebar_motion.y.pos();
+        moved || self.sidebar_motion.is_animating()
     }
 
     fn shift_months(&mut self, delta: i32) {
@@ -574,6 +605,8 @@ impl Application for CalendarApp {
             today,
             win: (1060.0, 720.0),
             sidebar_scroll: 0.0,
+            sidebar_motion: ScrollMotion::new(),
+            month_wheel_px: 0.0,
             status: None,
         }
     }
@@ -595,10 +628,13 @@ impl Application for CalendarApp {
         }
     }
 
-    fn tick(&mut self, _dt: f32, needs_rebuild: &mut bool) {
+    fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
         let now = Local::now().date_naive();
         if now != self.today {
             self.today = now;
+            *needs_rebuild = true;
+        }
+        if self.tick_sidebar_scroll(dt) {
             *needs_rebuild = true;
         }
     }
@@ -642,14 +678,51 @@ impl Application for CalendarApp {
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
         let g = self.geom();
         if hit(&g.sidebar, pos.x, pos.y) {
-            let events = self.events.get(&self.selected).map_or(0, Vec::len);
-            let overflow = (events as f32 * ROW_H - (g.sidebar.height - 58.0 - INPUT_H - 8.0)).max(0.0);
-            self.sidebar_scroll = (self.sidebar_scroll - delta.notches_y() * ROW_H).clamp(0.0, overflow);
-            *needs_rebuild = true;
+            // A notch is one row, pixel deltas are 1:1. The motion glides
+            // notches and coasts a flick; `tick_sidebar_scroll` carries the
+            // drawn offset after it. A true return is the repaint signal.
+            let overflow = self.sidebar_overflow(&g);
+            self.sidebar_motion.reconcile(0.0, self.sidebar_scroll);
+            if self.sidebar_motion.apply(delta, (ROW_H, ROW_H), Bounds::max(0.0), Bounds::max(overflow)) {
+                self.sidebar_scroll = self.sidebar_motion.y.pos();
+                *needs_rebuild = true;
+            }
         } else {
-            let notches = delta.notches_y();
-            if notches != 0.0 {
-                self.shift_months(if notches < 0.0 { 1 } else { -1 });
+            // Month stepping stays discrete: one month per wheel notch. A
+            // trackpad gesture accumulates pixels and steps once per
+            // MONTH_STEP_PX instead of once per pixel event, carrying the
+            // remainder until the finger lifts.
+            let step = match delta {
+                MouseScrollDelta::LineDelta(_, y) => {
+                    self.month_wheel_px = 0.0;
+                    if *y < 0.0 {
+                        1
+                    } else if *y > 0.0 {
+                        -1
+                    } else {
+                        0
+                    }
+                }
+                MouseScrollDelta::PixelDelta(p) => {
+                    if current_scroll_phase() == ScrollPhase::FingerEnd {
+                        self.month_wheel_px = 0.0;
+                        0
+                    } else {
+                        self.month_wheel_px += p.y as f32;
+                        if self.month_wheel_px <= -MONTH_STEP_PX {
+                            self.month_wheel_px += MONTH_STEP_PX;
+                            1
+                        } else if self.month_wheel_px >= MONTH_STEP_PX {
+                            self.month_wheel_px -= MONTH_STEP_PX;
+                            -1
+                        } else {
+                            0
+                        }
+                    }
+                }
+            };
+            if step != 0 {
+                self.shift_months(step);
                 *needs_rebuild = true;
             }
         }

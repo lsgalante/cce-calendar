@@ -1,23 +1,30 @@
-//! `cce-calendar-sync` — read-only CalDAV mirror of iCloud calendars into
+//! `cce-calendar-sync` — read-only mirror of remote calendars into
 //! cce-calendar's `events.json`.
 //!
 //! Accounts come from the same `accounts.json` cce-mail reads (owned by
-//! cce-system-interface), passwords from the same `cce-mail` keyring service —
-//! an Apple app-specific password is valid for CalDAV as well as IMAP, so the
-//! credential that fetches mail fetches the calendar too. Only iCloud
-//! accounts are synced; Google's CalDAV endpoint refuses app passwords and
-//! waits on an OAuth scope change (step 3 of the sync plan).
+//! cce-system-interface). Two kinds are synced:
+//!
+//! - **iCloud**, over CalDAV, with the password from the `cce-mail` keyring
+//!   service — an Apple app-specific password is valid for CalDAV as well as
+//!   IMAP, so the credential that fetches mail fetches the calendar too.
+//! - **Google**, over the Calendar REST API, with the OAuth tokens the
+//!   settings app's Google sign-in stores (it requests `calendar.readonly`).
+//!   Google's CalDAV endpoint refuses app passwords, hence the API. The
+//!   access token is refreshed in memory each run and never written back:
+//!   accounts.json has enough writers already (cce-system-interface,
+//!   cce-mail), and a refresh grant costs one round trip.
 //!
 //! Each run replaces exactly the records whose `source` matches the account
-//! being synced ("icloud:<email>"); hand-entered events (no `source`) and
-//! other accounts' records pass through untouched. A record deleted in the
-//! app therefore reappears on the next tick — this mirror is read-only by
-//! design, and the server is the source of truth for what it owns.
+//! being synced ("icloud:<email>" / "google:<email>"); hand-entered events
+//! (no `source`) and other accounts' records pass through untouched. A
+//! record deleted in the app therefore reappears on the next tick — this
+//! mirror is read-only by design, and the server is the source of truth for
+//! what it owns.
 //!
-//! Recurring events are expanded server-side (`<C:expand>`), which also
-//! normalizes times to UTC. If a calendar's REPORT rejects expansion, the
-//! query is retried plain and RRULE-carrying events are skipped with a log
-//! line rather than shown on the wrong day.
+//! Recurring events are expanded server-side (CalDAV `<C:expand>`, Google
+//! `singleEvents=true`), which also normalizes times. If a CalDAV REPORT
+//! rejects expansion, the query is retried plain and RRULE-carrying events
+//! are skipped with a log line rather than shown on the wrong day.
 //!
 //! Usage: `cce-calendar-sync [--dry-run]`. Driven by cce-calendar-sync.timer;
 //! harmless to run by hand. Exits nonzero if any account failed (the timer
@@ -44,15 +51,15 @@ fn main() {
     env_logger::init();
     let dry_run = std::env::args().any(|a| a == "--dry-run");
 
-    let accounts = match icloud_accounts() {
-        Ok(a) => a,
-        Err(e) => {
+    let (icloud, google) = match (icloud_accounts(), google_accounts()) {
+        (Ok(i), Ok(g)) => (i, g),
+        (Err(e), _) | (_, Err(e)) => {
             log::error!("cannot read accounts: {e}");
             std::process::exit(1);
         }
     };
-    if accounts.is_empty() {
-        log::info!("no iCloud accounts in accounts.json; nothing to sync");
+    if icloud.is_empty() && google.is_empty() {
+        log::info!("no iCloud or Google (OAuth) accounts in accounts.json; nothing to sync");
         return;
     }
 
@@ -64,9 +71,22 @@ fn main() {
 
     let mut failed = false;
     let mut synced: Vec<(String, Vec<EventRecord>)> = Vec::new();
-    for acc in &accounts {
+    for acc in &icloud {
         let source = format!("icloud:{}", acc.email);
         match sync_account(acc, window) {
+            Ok(records) => {
+                log::info!("{}: {} event records", acc.email, records.len());
+                synced.push((source, records));
+            }
+            Err(e) => {
+                log::error!("{}: sync failed, keeping existing records: {e}", acc.email);
+                failed = true;
+            }
+        }
+    }
+    for acc in &google {
+        let source = format!("google:{}", acc.email);
+        match sync_google(acc, window) {
             Ok(records) => {
                 log::info!("{}: {} event records", acc.email, records.len());
                 synced.push((source, records));
@@ -160,6 +180,216 @@ fn is_icloud(acc: &AccountOnDisk) -> bool {
     let host = acc.imap.split(':').next().unwrap_or("");
     host.ends_with(".mail.me.com")
         || ["@icloud.com", "@me.com", "@mac.com"].iter().any(|d| acc.email.ends_with(d))
+}
+
+// ── Google (OAuth) ────────────────────────────────────────────────────────
+
+struct GoogleAccount {
+    email: String,
+    refresh_token: String,
+    client_id: String,
+    client_secret: String,
+}
+
+/// The OAuth fields the settings app's Google sign-in writes.
+#[derive(serde::Deserialize)]
+struct OAuthOnDisk {
+    email: String,
+    #[serde(default)]
+    is_oauth: bool,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct GoogleClientConfig {
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    client_secret: String,
+}
+
+fn google_accounts() -> Result<Vec<GoogleAccount>, String> {
+    let dir = cce_ui::config::cce_config_dir();
+    let path = dir.join("accounts.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let on_disk: Vec<OAuthOnDisk> =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    // An account without its own pinned client credentials falls back to
+    // the global template the settings app maintains.
+    let template: GoogleClientConfig = std::fs::read_to_string(dir.join("google_client.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for acc in on_disk {
+        if !acc.is_oauth {
+            continue;
+        }
+        let Some(refresh_token) = acc.refresh_token.filter(|t| !t.is_empty()) else {
+            log::warn!("{}: OAuth account without a refresh token; sign in again", acc.email);
+            continue;
+        };
+        out.push(GoogleAccount {
+            email: acc.email,
+            refresh_token,
+            client_id: acc.client_id.filter(|s| !s.is_empty()).unwrap_or(template.client_id.clone()),
+            client_secret: acc
+                .client_secret
+                .filter(|s| !s.is_empty())
+                .unwrap_or(template.client_secret.clone()),
+        });
+    }
+    Ok(out)
+}
+
+/// A fresh access token from the refresh grant. Tokens last an hour and a
+/// tick is one request burst, so refreshing every run is simpler than
+/// tracking expiry — and keeps this helper from writing accounts.json.
+fn google_access_token(
+    client: &reqwest::blocking::Client,
+    acc: &GoogleAccount,
+) -> Result<String, String> {
+    let resp = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("client_id", acc.client_id.as_str()),
+            ("client_secret", acc.client_secret.as_str()),
+            ("refresh_token", acc.refresh_token.as_str()),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .map_err(|e| format!("token refresh: {e}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().map_err(|e| format!("token refresh: {e}"))?;
+    if !status.is_success() {
+        // invalid_grant here means the refresh token was revoked or the
+        // consent predates the calendar scope — a re-login fixes both.
+        return Err(format!("token refresh: HTTP {status} {body}"));
+    }
+    body.get("access_token")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| "token refresh: no access_token in response".to_string())
+}
+
+fn google_get(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    url: &str,
+    query: &[(&str, &str)],
+) -> Result<serde_json::Value, String> {
+    let resp = client
+        .get(url)
+        .bearer_auth(token)
+        .query(query)
+        .send()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().map_err(|e| format!("GET {url}: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("GET {url}: HTTP {status} {body}"));
+    }
+    Ok(body)
+}
+
+fn sync_google(
+    acc: &GoogleAccount,
+    window: (NaiveDate, NaiveDate),
+) -> Result<Vec<EventRecord>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let token = google_access_token(&client, acc)?;
+
+    // Only calendars the user keeps visible in Google's own UI (`selected`);
+    // subscribed-but-hidden ones stay hidden here too.
+    let list = google_get(
+        &client, &token,
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+        &[("fields", "items(id,summary,selected,deleted)")],
+    )?;
+    let calendars: Vec<(String, String)> = list["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|c| c["selected"].as_bool().unwrap_or(false) && !c["deleted"].as_bool().unwrap_or(false))
+                .filter_map(|c| {
+                    Some((c["id"].as_str()?.to_string(), c["summary"].as_str().unwrap_or("?").to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    log::info!("{}: {} visible calendar(s)", acc.email, calendars.len());
+
+    let source = format!("google:{}", acc.email);
+    let time_min = format!("{}T00:00:00Z", window.0);
+    let time_max = format!("{}T00:00:00Z", window.1);
+    let mut seen = BTreeSet::new();
+    let mut records = Vec::new();
+    for (id, name) in &calendars {
+        let url = format!(
+            "https://www.googleapis.com/calendar/v3/calendars/{}/events",
+            urlencode(id)
+        );
+        let mut page_token = String::new();
+        loop {
+            let mut query = vec![
+                ("singleEvents", "true"),
+                ("timeMin", time_min.as_str()),
+                ("timeMax", time_max.as_str()),
+                ("maxResults", "2500"),
+                ("fields", "nextPageToken,items(summary,status,start,end,iCalUID)"),
+            ];
+            if !page_token.is_empty() {
+                query.push(("pageToken", page_token.as_str()));
+            }
+            let page = google_get(&client, &token, &url, &query)
+                .map_err(|e| format!("calendar {name}: {e}"))?;
+            for item in page["items"].as_array().into_iter().flatten() {
+                if let Some(ev) = google_event(item) {
+                    event_to_records(&ev, window, &source, &mut seen, &mut records);
+                }
+            }
+            match page["nextPageToken"].as_str() {
+                Some(t) if !t.is_empty() => page_token = t.to_string(),
+                _ => break,
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Google's `{date}` / `{dateTime}` pair onto the same DtValue the iCal
+/// path produces, so both feed one `event_to_records`.
+fn google_event(item: &serde_json::Value) -> Option<VEvent> {
+    let dt = |v: &serde_json::Value| -> Option<DtValue> {
+        if let Some(d) = v["date"].as_str() {
+            return NaiveDate::parse_from_str(d, "%Y-%m-%d").ok().map(DtValue::Date);
+        }
+        let s = v["dateTime"].as_str()?;
+        DateTime::parse_from_rfc3339(s).ok().map(|t| DtValue::Utc(t.with_timezone(&Utc)))
+    };
+    Some(VEvent {
+        uid: item["iCalUID"].as_str().unwrap_or("").to_string(),
+        summary: item["summary"].as_str().unwrap_or("").to_string(),
+        dtstart: Some(dt(&item["start"])?),
+        dtend: dt(&item["end"]),
+        cancelled: item["status"].as_str() == Some("cancelled"),
+        has_rrule: false,
+    })
+}
+
+/// Calendar ids are email-like and go into the path; only the few
+/// characters that could break it need escaping.
+fn urlencode(s: &str) -> String {
+    s.replace('%', "%25").replace('/', "%2F").replace('#', "%23").replace('?', "%3F").replace('@', "%40")
 }
 
 // ── CalDAV ────────────────────────────────────────────────────────────────

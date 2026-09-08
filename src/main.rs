@@ -4,8 +4,11 @@
 //! `$XDG_DATA_HOME/cce/calendar/events.json` (one flat list of
 //! date/time/title records) and are saved on every mutation. Records with a
 //! `source` are mirrored from a remote calendar by `cce-calendar-sync`
-//! (blue dot); they can be deleted here, but the next sync tick restores
-//! them — the server owns them.
+//! (blue dot). Events typed here are pushed to the default calendar on the
+//! next sync tick and come back carrying their identity; deleting a synced
+//! event here deletes it on the server — except instances of a recurring
+//! event, which are read-only mirrors (the app refuses). The file is
+//! re-read once a second when the sync rewrites it.
 //!
 //! Keys: arrows move the selected day · PageUp/PageDown month · [/] year ·
 //! t/Home today · n/Enter new event (a leading `HH:MM` token sets the
@@ -13,7 +16,9 @@
 //! months over the grid and scrolls the event list over the pane.
 //!
 //! Config (`~/.config/cce/cce-calendar/config.kdl`): `week-start "sunday"`
-//! (default monday).
+//! (default monday); `push-to "icloud"` / `"google"` / `"none"`, optionally
+//! `calendar="Name"`, picks where typed events are created (the sync's
+//! default is iCloud when such an account exists).
 
 use std::collections::BTreeMap;
 
@@ -64,6 +69,7 @@ struct Event {
     title: String,
     uid: Option<String>,
     source: Option<String>,
+    recurring: bool,
 }
 
 fn load_events() -> BTreeMap<NaiveDate, Vec<Event>> {
@@ -85,6 +91,7 @@ fn load_events() -> BTreeMap<NaiveDate, Vec<Event>> {
             title: rec.title,
             uid: rec.uid,
             source: rec.source,
+            recurring: rec.recurring,
         });
     }
     for events in map.values_mut() {
@@ -118,7 +125,7 @@ fn parse_event(raw: &str) -> Option<Event> {
         },
     };
     let title = if title.is_empty() { "(untitled)".to_string() } else { title };
-    Some(Event { time, title, uid: None, source: None })
+    Some(Event { time, title, uid: None, source: None, recurring: false })
 }
 
 fn week_start_config() -> Weekday {
@@ -202,6 +209,14 @@ struct CalendarApp {
     /// pixel event. Cleared by a wheel notch and by the finger lift.
     month_wheel_px: f32,
     status: Option<String>,
+    /// events.json as last read: mtime, polled once a second so the sync's
+    /// rewrites (pushed identities, phone-side changes) show up live.
+    file_mtime: Option<std::time::SystemTime>,
+    watch_timer: f32,
+}
+
+fn file_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(cce_calendar::data_path()).and_then(|m| m.modified()).ok()
 }
 
 impl CalendarApp {
@@ -252,6 +267,7 @@ impl CalendarApp {
         self.selected = date;
         self.sel_event = None;
         self.sidebar_scroll = 0.0;
+        self.status = None;
         if (date.year(), date.month()) != self.view {
             self.view = (date.year(), date.month());
         }
@@ -309,10 +325,24 @@ impl CalendarApp {
                     title: e.title.clone(),
                     uid: e.uid.clone(),
                     source: e.source.clone(),
+                    recurring: e.recurring,
                 })
             })
             .collect();
         self.status = save_records(&records).err().map(|e| format!("save failed: {e}"));
+        // Our own write must not read as an outside change next tick.
+        self.file_mtime = file_mtime();
+    }
+
+    /// Re-read events.json after something else wrote it, keeping the
+    /// selection where it still makes sense.
+    fn reload(&mut self) {
+        self.events = load_events();
+        self.file_mtime = file_mtime();
+        let n = self.events.get(&self.selected).map_or(0, Vec::len);
+        if self.sel_event.is_some_and(|i| i >= n) {
+            self.sel_event = None;
+        }
     }
 
     fn commit_input(&mut self) {
@@ -332,6 +362,13 @@ impl CalendarApp {
             return;
         };
         if let Some(day) = self.events.get_mut(&self.selected) {
+            if day.get(idx).is_some_and(|e| e.recurring) {
+                // One instance of a repeating event: the server has no
+                // "just this one" the mirror could express, so it stays.
+                self.sel_event = Some(idx);
+                self.status = Some("repeating event — change it on the phone".to_string());
+                return;
+            }
             if idx < day.len() {
                 day.remove(idx);
                 if day.is_empty() {
@@ -608,6 +645,8 @@ impl Application for CalendarApp {
             sidebar_motion: ScrollMotion::new(),
             month_wheel_px: 0.0,
             status: None,
+            file_mtime: file_mtime(),
+            watch_timer: 0.0,
         }
     }
 
@@ -636,6 +675,16 @@ impl Application for CalendarApp {
         }
         if self.tick_sidebar_scroll(dt) {
             *needs_rebuild = true;
+        }
+        // The sync timer rewrites events.json; pick that up without a
+        // relaunch — but not mid-typing, which a reload would clobber.
+        self.watch_timer += dt;
+        if self.watch_timer >= 1.0 {
+            self.watch_timer = 0.0;
+            if self.input.is_none() && file_mtime() != self.file_mtime {
+                self.reload();
+                *needs_rebuild = true;
+            }
         }
     }
 

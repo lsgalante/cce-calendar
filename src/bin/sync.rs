@@ -1,4 +1,4 @@
-//! `cce-calendar-sync` — read-only mirror of remote calendars into
+//! `cce-calendar-sync` — two-way sync between remote calendars and
 //! cce-calendar's `events.json`.
 //!
 //! Accounts come from the same `accounts.json` cce-mail reads (owned by
@@ -8,33 +8,44 @@
 //!   service — an Apple app-specific password is valid for CalDAV as well as
 //!   IMAP, so the credential that fetches mail fetches the calendar too.
 //! - **Google**, over the Calendar REST API, with the OAuth tokens the
-//!   settings app's Google sign-in stores (it requests `calendar.readonly`).
-//!   Google's CalDAV endpoint refuses app passwords, hence the API. The
-//!   access token is refreshed in memory each run and never written back:
-//!   accounts.json has enough writers already (cce-system-interface,
-//!   cce-mail), and a refresh grant costs one round trip.
+//!   settings app's Google sign-in stores (`calendar.readonly` to read,
+//!   `calendar.events` to write). Google's CalDAV endpoint refuses app
+//!   passwords, hence the API. The access token is refreshed in memory each
+//!   run and never written back: accounts.json has enough writers already.
 //!
-//! Each run replaces exactly the records whose `source` matches the account
-//! being synced ("icloud:<email>" / "google:<email>"); hand-entered events
-//! (no `source`) and other accounts' records pass through untouched. A
-//! record deleted in the app therefore reappears on the next tick — this
-//! mirror is read-only by design, and the server is the source of truth for
-//! what it owns.
+//! Reading is a mirror: each run replaces the records whose `source` matches
+//! the account ("icloud:<email>" / "google:<email>"), with recurrences
+//! expanded server-side (CalDAV `<C:expand>`, Google `singleEvents=true`)
+//! and marked `recurring`. Writing is a three-way merge against
+//! `sync-state.json`, the last-synced (date, time, title, etag) per
+//! NON-recurring event: a record typed in the app (no `source`) is created
+//! on the default calendar (`push-to` in the app's config.kdl; iCloud when
+//! unset and such an account exists) and comes back carrying its identity;
+//! a tracked event missing from the file is deleted on the server; one whose
+//! date, time or title differs from the state is updated there (local wins
+//! over a simultaneous remote edit; the next tick reconciles). Instances of
+//! recurring events are never written: the mirror cannot say "just this
+//! one", so a deleted instance simply reappears. Guards: a missing
+//! events.json re-imports rather than deletes, and a run that would delete
+//! most tracked events (>5 and >50%) refuses without `--force-deletes`.
 //!
-//! Recurring events are expanded server-side (CalDAV `<C:expand>`, Google
-//! `singleEvents=true`), which also normalizes times. If a CalDAV REPORT
-//! rejects expansion, the query is retried plain and RRULE-carrying events
-//! are skipped with a log line rather than shown on the wrong day.
+//! CalDAV updates PATCH the fetched iCalendar (SUMMARY, DTSTART, DTEND)
+//! rather than rebuilding it, so alarms and Apple's own properties survive;
+//! Google updates are field-level PATCHes with If-Match.
 //!
-//! Usage: `cce-calendar-sync [--dry-run]`. Driven by cce-calendar-sync.timer;
-//! harmless to run by hand. Exits nonzero if any account failed (the timer
-//! just tries again next tick); other accounts' results are still written.
+//! Usage: `cce-calendar-sync [--dry-run] [--force-deletes]`. Driven by
+//! cce-calendar-sync.timer; harmless to run by hand. Exits nonzero if any
+//! account failed (the timer just tries again next tick); other accounts'
+//! results are still written.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
-use chrono::{DateTime, Days, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use cce_calendar::{load_records, save_records, EventRecord};
+use cce_calendar::{
+    data_path, load_records, load_sync_state, push_target_config, save_records, save_sync_state,
+    sort_records, EventRecord, PushTarget, SyncState, SyncedEvent,
+};
+use chrono::{DateTime, Days, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 const CALDAV_ROOT: &str = "https://caldav.icloud.com/";
 /// Sync window around today. Wide enough forward that "next spring" plans
@@ -44,12 +55,16 @@ const FUTURE_DAYS: u64 = 400;
 /// An all-day event spanning more than this is almost certainly bad data
 /// (a botched DTEND); clamp rather than flood two months of cells.
 const MAX_ALLDAY_SPAN: u64 = 62;
+/// A timed event typed in the app has no end; it is created an hour long.
+const DEFAULT_DURATION_MIN: i64 = 60;
 
 const CALDAV_NS: &str = "urn:ietf:params:xml:ns:caldav";
 
 fn main() {
     env_logger::init();
-    let dry_run = std::env::args().any(|a| a == "--dry-run");
+    let args: Vec<String> = std::env::args().collect();
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let force_deletes = args.iter().any(|a| a == "--force-deletes");
 
     let (icloud, google) = match (icloud_accounts(), google_accounts()) {
         (Ok(i), Ok(g)) => (i, g),
@@ -69,61 +84,421 @@ fn main() {
         today.checked_add_days(Days::new(FUTURE_DAYS)).unwrap_or(today),
     );
 
-    let mut failed = false;
-    let mut synced: Vec<(String, Vec<EventRecord>)> = Vec::new();
-    for acc in &icloud {
-        let source = format!("icloud:{}", acc.email);
-        match sync_account(acc, window) {
-            Ok(records) => {
-                log::info!("{}: {} event records", acc.email, records.len());
-                synced.push((source, records));
-            }
-            Err(e) => {
-                log::error!("{}: sync failed, keeping existing records: {e}", acc.email);
-                failed = true;
-            }
+    // Typed events go to one calendar; the account kind that owns it.
+    let push = push_target_config().unwrap_or_else(|| PushTarget {
+        kind: if !icloud.is_empty() { "icloud" } else { "google" }.to_string(),
+        calendar: None,
+    });
+
+    let had_file = data_path().exists();
+    let mut records = match load_records() {
+        Ok(r) => r,
+        Err(e) => {
+            // Refuse to rewrite a file we could not read — that would
+            // silently drop every hand-entered event.
+            log::error!("events.json unreadable, not writing: {e}");
+            std::process::exit(1);
         }
+    };
+    let mut state = match load_sync_state() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("sync-state.json unreadable: {e}");
+            std::process::exit(1);
+        }
+    };
+    if !had_file && !state.events.is_empty() {
+        // The file is gone (fresh clone, deleted). Re-import rather than
+        // reading absence as "delete everything on the server".
+        log::warn!("events.json missing; discarding sync state and re-importing");
+        state = SyncState::default();
     }
-    for acc in &google {
-        let source = format!("google:{}", acc.email);
-        match sync_google(acc, window) {
-            Ok(records) => {
-                log::info!("{}: {} event records", acc.email, records.len());
-                synced.push((source, records));
-            }
+
+    let mut failed = false;
+    let mut synced_any = false;
+    let backends: Vec<Backend> = icloud
+        .into_iter()
+        .map(Backend::ICloud)
+        .chain(google.into_iter().map(Backend::Google))
+        .collect();
+    for (i, backend) in backends.iter().enumerate() {
+        let push_here = push.kind == backend.kind()
+            && backends.iter().position(|b| b.kind() == push.kind) == Some(i);
+        match sync_source(backend, window, &push, push_here, &mut records, &mut state, dry_run, force_deletes)
+        {
+            Ok(()) => synced_any = true,
             Err(e) => {
-                log::error!("{}: sync failed, keeping existing records: {e}", acc.email);
+                log::error!("{}: sync failed, keeping existing records: {e}", backend.email());
                 failed = true;
             }
         }
     }
 
-    if !synced.is_empty() {
-        let existing = match load_records() {
-            Ok(r) => r,
-            Err(e) => {
-                // Refuse to rewrite a file we could not read — that would
-                // silently drop every hand-entered event.
-                log::error!("events.json unreadable, not writing: {e}");
-                std::process::exit(1);
-            }
-        };
-        let merged = merge(existing, &synced);
-        if dry_run {
-            for (source, records) in &synced {
-                for r in records {
-                    println!("{source}: {} {} {}", r.date, r.time.as_deref().unwrap_or("-----"), r.title);
-                }
-            }
-            println!("dry run: {} records total after merge, not written", merged.len());
-        } else if let Err(e) = save_records(&merged) {
+    if synced_any && !dry_run {
+        sort_records(&mut records);
+        if let Err(e) = save_records(&records) {
             log::error!("saving events.json failed: {e}");
+            failed = true;
+        }
+        if let Err(e) = save_sync_state(&state) {
+            log::error!("saving sync-state.json failed: {e}");
             failed = true;
         }
     }
     if failed {
         std::process::exit(1);
     }
+}
+
+enum Backend {
+    ICloud(Account),
+    Google(GoogleAccount),
+}
+
+impl Backend {
+    fn email(&self) -> &str {
+        match self {
+            Backend::ICloud(a) => &a.email,
+            Backend::Google(a) => &a.email,
+        }
+    }
+    fn kind(&self) -> &'static str {
+        match self {
+            Backend::ICloud(_) => "icloud",
+            Backend::Google(_) => "google",
+        }
+    }
+    fn source(&self) -> String {
+        format!("{}:{}", self.kind(), self.email())
+    }
+}
+
+// ── Remote model (both backends produce it) ───────────────────────────────
+
+struct RemoteCalendar {
+    /// Where a new event is created (CalDAV collection URL / Google
+    /// calendar id).
+    target: String,
+    name: String,
+    primary: bool,
+}
+
+struct RemoteEvent {
+    url: reqwest::Url,
+    etag: String,
+    recurring: bool,
+    /// Every dated instance in the window, ready for the file.
+    instances: Vec<EventRecord>,
+    /// Unfolded logical lines of the resource (CalDAV only), for
+    /// patch-and-PUT.
+    lines: Vec<String>,
+}
+
+struct Remote {
+    calendars: Vec<RemoteCalendar>,
+    events: BTreeMap<String, RemoteEvent>,
+}
+
+// ── One account ───────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn sync_source(
+    backend: &Backend,
+    window: (NaiveDate, NaiveDate),
+    push: &PushTarget,
+    push_here: bool,
+    records: &mut Vec<EventRecord>,
+    state: &mut SyncState,
+    dry_run: bool,
+    force_deletes: bool,
+) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let source = backend.source();
+    let session = match backend {
+        Backend::ICloud(_) => Session::ICloud,
+        Backend::Google(acc) => Session::Google(google_access_token(&client, acc)?),
+    };
+    let ops = Ops { client: &client, backend, session: &session };
+    let mut remote = ops.fetch(window, &source)?;
+    log::info!(
+        "{}: {} calendar(s), {} event(s) in window",
+        backend.email(),
+        remote.calendars.len(),
+        remote.events.len()
+    );
+
+    // ── Plan ───────────────────────────────────────────────────────────
+    let local_by_uid: BTreeMap<&str, &EventRecord> = records
+        .iter()
+        .filter(|r| r.source.as_deref() == Some(&source))
+        .filter_map(|r| r.uid.as_deref().map(|u| (u, r)))
+        .collect();
+    let mut push_deletes: Vec<String> = Vec::new();
+    let mut push_updates: Vec<(String, EventRecord)> = Vec::new();
+    let mut forget: Vec<String> = Vec::new();
+    for (uid, s) in state.events.iter().filter(|(_, s)| s.source == source) {
+        match remote.events.get(uid) {
+            None => forget.push(uid.clone()),
+            Some(r) if r.recurring => forget.push(uid.clone()),
+            Some(_) => match local_by_uid.get(uid.as_str()) {
+                None => push_deletes.push(uid.clone()),
+                Some(l) if !s.matches(l) => push_updates.push((uid.clone(), (*l).clone())),
+                Some(_) => {}
+            },
+        }
+    }
+    let push_creates: Vec<usize> = if push_here {
+        records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.source.is_none() && r.uid.is_none())
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let tracked = state.events.values().filter(|s| s.source == source).count();
+    if !force_deletes && push_deletes.len() > 5 && push_deletes.len() * 2 > tracked {
+        return Err(format!(
+            "refusing to delete {} of {tracked} tracked events on the server — if they were \
+             really removed on purpose, run cce-calendar-sync --force-deletes",
+            push_deletes.len()
+        ));
+    }
+    log::info!(
+        "{}: push {} new / {} changed / {} deleted",
+        backend.email(),
+        push_creates.len(),
+        push_updates.len(),
+        push_deletes.len()
+    );
+    let target = if push_here { Some(ops.pick_target(&remote.calendars, push)?) } else { None };
+    if let Some(t) = &target {
+        if !push_creates.is_empty() {
+            log::info!("{}: new events go to {}", backend.email(), t.name);
+        }
+    }
+    if dry_run {
+        for i in &push_creates {
+            let r = &records[*i];
+            println!("push new:    {} {} {}", r.date, r.time.as_deref().unwrap_or("-----"), r.title);
+        }
+        for (uid, r) in &push_updates {
+            println!("push change: {} {} {} ({uid})", r.date, r.time.as_deref().unwrap_or("-----"), r.title);
+        }
+        for uid in &push_deletes {
+            println!("push delete: {} ({uid})", state.events[uid].title);
+        }
+        let mirrored: usize = remote.events.values().map(|e| e.instances.len()).sum();
+        println!("{source}: {mirrored} record(s) mirrored");
+        return Ok(());
+    }
+
+    // ── Server side ────────────────────────────────────────────────────
+    for uid in &push_deletes {
+        let s = &state.events[uid];
+        let url = reqwest::Url::parse(&s.url).map_err(|e| e.to_string())?;
+        match ops.delete(&url, &s.etag) {
+            Ok(()) => {
+                state.events.remove(uid);
+                remote.events.remove(uid);
+            }
+            Err(e) => log::warn!("push delete {uid} failed (will retry next tick): {e}"),
+        }
+    }
+    for (uid, local) in &push_updates {
+        let Some(r) = remote.events.get_mut(uid) else { continue };
+        match ops.update(r, local) {
+            Ok(etag) => {
+                r.etag = etag.clone();
+                r.instances = vec![EventRecord {
+                    uid: Some(uid.clone()),
+                    source: Some(source.clone()),
+                    recurring: false,
+                    ..local.clone()
+                }];
+                state.events.insert(uid.clone(), synced(&source, &r.url, etag, local));
+            }
+            Err(e) => log::warn!("push update {uid} failed (will retry next tick): {e}"),
+        }
+    }
+    let mut consumed: BTreeSet<usize> = BTreeSet::new();
+    if let Some(t) = &target {
+        for i in &push_creates {
+            let local = &records[*i];
+            match ops.create(t, local) {
+                Ok((uid, url, etag)) => {
+                    state.events.insert(uid.clone(), synced(&source, &url, etag.clone(), local));
+                    remote.events.insert(
+                        uid.clone(),
+                        RemoteEvent {
+                            url,
+                            etag,
+                            recurring: false,
+                            instances: vec![EventRecord {
+                                uid: Some(uid),
+                                source: Some(source.clone()),
+                                recurring: false,
+                                ..local.clone()
+                            }],
+                            lines: Vec::new(),
+                        },
+                    );
+                    consumed.insert(*i);
+                }
+                Err(e) => log::warn!("push create {:?} failed (will retry next tick): {e}", local.title),
+            }
+        }
+    }
+
+    // ── State: every non-recurring event the server now holds ─────────
+    for uid in &forget {
+        state.events.remove(uid);
+    }
+    for (uid, r) in &remote.events {
+        if r.recurring {
+            continue;
+        }
+        if let Some(first) = r.instances.first() {
+            state.events.insert(uid.clone(), synced(&source, &r.url, r.etag.clone(), first));
+        }
+    }
+
+    // ── File: this source's records are the fresh mirror ──────────────
+    let mut idx = 0;
+    records.retain(|r| {
+        let keep = r.source.as_deref() != Some(&source) && !consumed.contains(&idx);
+        idx += 1;
+        keep
+    });
+    for r in remote.events.values() {
+        records.extend(r.instances.iter().cloned());
+    }
+    Ok(())
+}
+
+fn synced(source: &str, url: &reqwest::Url, etag: String, r: &EventRecord) -> SyncedEvent {
+    SyncedEvent {
+        source: source.to_string(),
+        url: url.to_string(),
+        etag,
+        date: r.date.clone(),
+        time: r.time.clone(),
+        title: r.title.clone(),
+    }
+}
+
+/// Per-run credentials the requests need beyond the account itself.
+enum Session {
+    ICloud,
+    Google(String),
+}
+
+/// The backend operations, bundled so the pass reads the same either way.
+struct Ops<'a> {
+    client: &'a reqwest::blocking::Client,
+    backend: &'a Backend,
+    session: &'a Session,
+}
+
+impl Ops<'_> {
+    fn token(&self) -> &str {
+        match self.session {
+            Session::Google(t) => t,
+            Session::ICloud => "",
+        }
+    }
+
+    fn fetch(&self, window: (NaiveDate, NaiveDate), source: &str) -> Result<Remote, String> {
+        match self.backend {
+            Backend::ICloud(acc) => fetch_icloud(self.client, acc, window, source),
+            Backend::Google(acc) => fetch_google(self.client, self.token(), acc, window, source),
+        }
+    }
+
+    /// The calendar typed events are created on: the configured name, else
+    /// the account's primary (Google) or first (iCloud) event calendar.
+    fn pick_target<'c>(
+        &self,
+        calendars: &'c [RemoteCalendar],
+        push: &PushTarget,
+    ) -> Result<&'c RemoteCalendar, String> {
+        if let Some(name) = &push.calendar {
+            return calendars
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| format!("push-to calendar {name:?} not found on this account"));
+        }
+        calendars
+            .iter()
+            .find(|c| c.primary)
+            .or_else(|| calendars.first())
+            .ok_or_else(|| "no writable calendar on this account".to_string())
+    }
+
+    fn create(
+        &self,
+        target: &RemoteCalendar,
+        r: &EventRecord,
+    ) -> Result<(String, reqwest::Url, String), String> {
+        match self.backend {
+            Backend::ICloud(acc) => {
+                let uid = new_uid();
+                let base = reqwest::Url::parse(&target.target).map_err(|e| e.to_string())?;
+                let url = base.join(&format!("{uid}.ics")).map_err(|e| e.to_string())?;
+                let etag = put_ics(self.client, acc, &url, &new_vevent(&uid, r)?, None)?;
+                Ok((uid, url, etag))
+            }
+            Backend::Google(_) => google_create(self.client, self.token(), &target.target, r),
+        }
+    }
+
+    fn update(&self, remote: &RemoteEvent, r: &EventRecord) -> Result<String, String> {
+        match self.backend {
+            Backend::ICloud(acc) => {
+                let body = patch_vevent(&remote.lines, r)?;
+                put_ics(self.client, acc, &remote.url, &body, Some(&remote.etag))
+            }
+            Backend::Google(_) => google_update(self.client, self.token(), &remote.url, &remote.etag, r),
+        }
+    }
+
+    fn delete(&self, url: &reqwest::Url, etag: &str) -> Result<(), String> {
+        match self.backend {
+            Backend::ICloud(acc) => delete_ics(self.client, acc, url, etag),
+            Backend::Google(_) => google_delete(self.client, self.token(), url),
+        }
+    }
+}
+
+// ── Time helpers ──────────────────────────────────────────────────────────
+
+fn parse_record_time(r: &EventRecord) -> Result<(NaiveDate, Option<(u32, u32)>), String> {
+    let date = r.date.parse::<NaiveDate>().map_err(|e| format!("bad date {:?}: {e}", r.date))?;
+    let time = match &r.time {
+        None => None,
+        Some(t) => {
+            let (h, m) = t.split_once(':').ok_or_else(|| format!("bad time {t:?}"))?;
+            Some((h.parse().map_err(|_| format!("bad time {t:?}"))?, m.parse().map_err(|_| format!("bad time {t:?}"))?))
+        }
+    };
+    Ok((date, time))
+}
+
+/// A record's start (and default end) as local wall-clock instants.
+fn record_span(r: &EventRecord) -> Result<(DateTime<Local>, DateTime<Local>), String> {
+    let (date, time) = parse_record_time(r)?;
+    let (h, m) = time.unwrap_or((0, 0));
+    let ndt = date.and_hms_opt(h, m, 0).ok_or("bad time")?;
+    let start = Local
+        .from_local_datetime(&ndt)
+        .earliest()
+        .ok_or_else(|| format!("{ndt} does not exist in the local timezone"))?;
+    Ok((start, start + Duration::minutes(DEFAULT_DURATION_MIN)))
 }
 
 // ── Accounts ──────────────────────────────────────────────────────────────
@@ -277,67 +652,80 @@ fn google_access_token(
         .ok_or_else(|| "token refresh: no access_token in response".to_string())
 }
 
-fn google_get(
+fn google_call(
     client: &reqwest::blocking::Client,
     token: &str,
+    method: reqwest::Method,
     url: &str,
     query: &[(&str, &str)],
+    body: Option<&serde_json::Value>,
+    if_match: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let resp = client
-        .get(url)
-        .bearer_auth(token)
-        .query(query)
-        .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().map_err(|e| format!("GET {url}: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("GET {url}: HTTP {status} {body}"));
+    let mut req = client.request(method.clone(), url).bearer_auth(token).query(query);
+    if let Some(b) = body {
+        req = req.json(b);
     }
-    Ok(body)
+    if let Some(e) = if_match.filter(|e| !e.is_empty()) {
+        req = req.header("If-Match", e);
+    }
+    let resp = req.send().map_err(|e| format!("{method} {url}: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NO_CONTENT {
+        return Ok(serde_json::Value::Null);
+    }
+    let text = resp.text().map_err(|e| format!("{method} {url}: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("{method} {url}: HTTP {status} {text}"));
+    }
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(&text).map_err(|e| format!("{method} {url}: bad JSON: {e}"))
 }
 
-fn sync_google(
+const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3";
+
+fn google_events_url(cal_id: &str) -> String {
+    format!("{CALENDAR_API}/calendars/{}/events", urlencode(cal_id))
+}
+
+fn fetch_google(
+    client: &reqwest::blocking::Client,
+    token: &str,
     acc: &GoogleAccount,
     window: (NaiveDate, NaiveDate),
-) -> Result<Vec<EventRecord>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let token = google_access_token(&client, acc)?;
-
+    source: &str,
+) -> Result<Remote, String> {
+    let get = |url: &str, q: &[(&str, &str)]| {
+        google_call(client, token, reqwest::Method::GET, url, q, None, None)
+    };
     // Only calendars the user keeps visible in Google's own UI (`selected`);
     // subscribed-but-hidden ones stay hidden here too.
-    let list = google_get(
-        &client, &token,
-        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
-        &[("fields", "items(id,summary,selected,deleted)")],
+    let list = get(
+        &format!("{CALENDAR_API}/users/me/calendarList"),
+        &[("fields", "items(id,summary,selected,deleted,primary,accessRole)")],
     )?;
-    let calendars: Vec<(String, String)> = list["items"]
+    let calendars: Vec<RemoteCalendar> = list["items"]
         .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter(|c| c["selected"].as_bool().unwrap_or(false) && !c["deleted"].as_bool().unwrap_or(false))
-                .filter_map(|c| {
-                    Some((c["id"].as_str()?.to_string(), c["summary"].as_str().unwrap_or("?").to_string()))
-                })
-                .collect()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["selected"].as_bool().unwrap_or(false) && !c["deleted"].as_bool().unwrap_or(false))
+        .filter_map(|c| {
+            Some(RemoteCalendar {
+                target: c["id"].as_str()?.to_string(),
+                name: c["summary"].as_str().unwrap_or("?").to_string(),
+                primary: c["primary"].as_bool().unwrap_or(false),
+            })
         })
-        .unwrap_or_default();
-    log::info!("{}: {} visible calendar(s)", acc.email, calendars.len());
+        .collect();
+    let _ = acc;
 
-    let source = format!("google:{}", acc.email);
     let time_min = format!("{}T00:00:00Z", window.0);
     let time_max = format!("{}T00:00:00Z", window.1);
+    let mut events: BTreeMap<String, RemoteEvent> = BTreeMap::new();
     let mut seen = BTreeSet::new();
-    let mut records = Vec::new();
-    for (id, name) in &calendars {
-        let url = format!(
-            "https://www.googleapis.com/calendar/v3/calendars/{}/events",
-            urlencode(id)
-        );
+    for cal in &calendars {
+        let url = google_events_url(&cal.target);
         let mut page_token = String::new();
         loop {
             let mut query = vec![
@@ -345,17 +733,28 @@ fn sync_google(
                 ("timeMin", time_min.as_str()),
                 ("timeMax", time_max.as_str()),
                 ("maxResults", "2500"),
-                ("fields", "nextPageToken,items(summary,status,start,end,iCalUID)"),
+                ("fields", "nextPageToken,items(id,iCalUID,recurringEventId,etag,summary,status,start,end)"),
             ];
             if !page_token.is_empty() {
                 query.push(("pageToken", page_token.as_str()));
             }
-            let page = google_get(&client, &token, &url, &query)
-                .map_err(|e| format!("calendar {name}: {e}"))?;
+            let page = get(&url, &query).map_err(|e| format!("calendar {}: {e}", cal.name))?;
             for item in page["items"].as_array().into_iter().flatten() {
-                if let Some(ev) = google_event(item) {
-                    event_to_records(&ev, window, &source, &mut seen, &mut records);
-                }
+                let Some(ev) = google_event(item) else { continue };
+                let id = item["id"].as_str().unwrap_or("").to_string();
+                let uid = item["iCalUID"].as_str().map(String::from).unwrap_or_else(|| id.clone());
+                let recurring = item["recurringEventId"].is_string();
+                let mut instances = Vec::new();
+                event_to_records(&ev, window, source, recurring, &mut seen, &mut instances);
+                let entry = events.entry(uid).or_insert_with(|| RemoteEvent {
+                    url: reqwest::Url::parse(&format!("{url}/{id}")).expect("valid url"),
+                    etag: item["etag"].as_str().unwrap_or("").to_string(),
+                    recurring,
+                    instances: Vec::new(),
+                    lines: Vec::new(),
+                });
+                entry.recurring |= recurring;
+                entry.instances.extend(instances);
             }
             match page["nextPageToken"].as_str() {
                 Some(t) if !t.is_empty() => page_token = t.to_string(),
@@ -363,7 +762,9 @@ fn sync_google(
             }
         }
     }
-    Ok(records)
+    // Cancelled instances leave an empty entry; drop those.
+    events.retain(|_, e| !e.instances.is_empty());
+    Ok(Remote { calendars, events })
 }
 
 /// Google's `{date}` / `{dateTime}` pair onto the same DtValue the iCal
@@ -383,7 +784,64 @@ fn google_event(item: &serde_json::Value) -> Option<VEvent> {
         dtend: dt(&item["end"]),
         cancelled: item["status"].as_str() == Some("cancelled"),
         has_rrule: false,
+        has_recurrence_id: false,
     })
+}
+
+fn google_body(r: &EventRecord) -> Result<serde_json::Value, String> {
+    let (date, time) = parse_record_time(r)?;
+    let (start, end) = if time.is_some() {
+        let (s, e) = record_span(r)?;
+        (
+            serde_json::json!({ "dateTime": s.to_rfc3339() }),
+            serde_json::json!({ "dateTime": e.to_rfc3339() }),
+        )
+    } else {
+        let next = date.checked_add_days(Days::new(1)).ok_or("date overflow")?;
+        (
+            serde_json::json!({ "date": date.to_string() }),
+            serde_json::json!({ "date": next.to_string() }),
+        )
+    };
+    Ok(serde_json::json!({ "summary": r.title, "start": start, "end": end }))
+}
+
+fn google_create(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    cal_id: &str,
+    r: &EventRecord,
+) -> Result<(String, reqwest::Url, String), String> {
+    let body = google_body(r)?;
+    let url = google_events_url(cal_id);
+    let resp = google_call(client, token, reqwest::Method::POST, &url, &[], Some(&body), None)?;
+    let id = resp["id"].as_str().ok_or("created event has no id")?.to_string();
+    let uid = resp["iCalUID"].as_str().map(String::from).unwrap_or_else(|| id.clone());
+    let event_url = reqwest::Url::parse(&format!("{url}/{id}")).map_err(|e| e.to_string())?;
+    Ok((uid, event_url, resp["etag"].as_str().unwrap_or("").to_string()))
+}
+
+/// Field-level PATCH: summary, start, end — a description, attendees or
+/// reminders set in Google's own apps ride through untouched.
+fn google_update(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    url: &reqwest::Url,
+    etag: &str,
+    r: &EventRecord,
+) -> Result<String, String> {
+    let body = google_body(r)?;
+    let resp = google_call(client, token, reqwest::Method::PATCH, url.as_str(), &[], Some(&body), Some(etag))?;
+    Ok(resp["etag"].as_str().unwrap_or("").to_string())
+}
+
+fn google_delete(client: &reqwest::blocking::Client, token: &str, url: &reqwest::Url) -> Result<(), String> {
+    match google_call(client, token, reqwest::Method::DELETE, url.as_str(), &[], None, None) {
+        Ok(_) => Ok(()),
+        // Already gone counts as done.
+        Err(e) if e.contains("HTTP 404") || e.contains("HTTP 410") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Calendar ids are email-like and go into the path; only the few
@@ -392,48 +850,41 @@ fn urlencode(s: &str) -> String {
     s.replace('%', "%25").replace('/', "%2F").replace('#', "%23").replace('?', "%3F").replace('@', "%40")
 }
 
-// ── CalDAV ────────────────────────────────────────────────────────────────
+// ── CalDAV (iCloud) ───────────────────────────────────────────────────────
 
-fn sync_account(
+fn fetch_icloud(
+    client: &reqwest::blocking::Client,
     acc: &Account,
     window: (NaiveDate, NaiveDate),
-) -> Result<Vec<EventRecord>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| e.to_string())?;
-
+    source: &str,
+) -> Result<Remote, String> {
     let root = reqwest::Url::parse(CALDAV_ROOT).expect("static url");
     let principal = discover_href(
-        &client, acc, &root, "0",
+        client, acc, &root, "0",
         r#"<?xml version="1.0" encoding="utf-8"?>
 <propfind xmlns="DAV:"><prop><current-user-principal/></prop></propfind>"#,
         "current-user-principal",
     )?;
     let home = discover_href(
-        &client, acc, &principal, "0",
+        client, acc, &principal, "0",
         r#"<?xml version="1.0" encoding="utf-8"?>
 <propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><prop><C:calendar-home-set/></prop></propfind>"#,
         "calendar-home-set",
     )?;
-    let calendars = list_event_calendars(&client, acc, &home)?;
-    log::info!("{}: {} calendar(s) with events", acc.email, calendars.len());
+    let calendars = list_event_calendars(client, acc, &home)?;
 
     let (start, end) = (
         format!("{}T000000Z", window.0.format("%Y%m%d")),
         format!("{}T000000Z", window.1.format("%Y%m%d")),
     );
-    let source = format!("icloud:{}", acc.email);
+    let mut events = BTreeMap::new();
     let mut seen = BTreeSet::new();
-    let mut records = Vec::new();
-    for (cal_url, cal_name) in &calendars {
-        let events = fetch_events(&client, acc, cal_url, &start, &end)
-            .map_err(|e| format!("calendar {cal_name}: {e}"))?;
-        for ev in events {
-            event_to_records(&ev, window, &source, &mut seen, &mut records);
-        }
+    for cal in &calendars {
+        let cal_url = reqwest::Url::parse(&cal.target).map_err(|e| e.to_string())?;
+        fetch_events(client, acc, &cal_url, &start, &end, window, source, &mut seen, &mut events)
+            .map_err(|e| format!("calendar {}: {e}", cal.name))?;
     }
-    Ok(records)
+    Ok(Remote { calendars, events })
 }
 
 fn dav_request(
@@ -487,12 +938,12 @@ fn discover_href(
 
 /// Depth-1 PROPFIND on the calendar home: the child collections that are
 /// calendars and hold VEVENTs (Reminders lists are VTODO-only and excluded —
-/// they are cce-list's, in a later step).
+/// they are cce-list's).
 fn list_event_calendars(
     client: &reqwest::blocking::Client,
     acc: &Account,
     home: &reqwest::Url,
-) -> Result<Vec<(reqwest::Url, String)>, String> {
+) -> Result<Vec<RemoteCalendar>, String> {
     let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <prop><resourcetype/><displayname/><C:supported-calendar-component-set/></prop>
@@ -537,7 +988,7 @@ fn list_event_calendars(
         if url.path().trim_end_matches('/') == home.path().trim_end_matches('/') {
             continue; // the home collection lists itself first
         }
-        out.push((url, name));
+        out.push(RemoteCalendar { target: url.to_string(), name, primary: false });
     }
     Ok(out)
 }
@@ -551,7 +1002,7 @@ fn calendar_query(start: &str, end: &str, expand: bool) -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-  <D:prop>{data}</D:prop>
+  <D:prop><D:getetag/>{data}</D:prop>
   <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
     <C:time-range start="{start}" end="{end}"/>
   </C:comp-filter></C:comp-filter></C:filter>
@@ -559,13 +1010,18 @@ fn calendar_query(start: &str, end: &str, expand: bool) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_events(
     client: &reqwest::blocking::Client,
     acc: &Account,
     cal: &reqwest::Url,
     start: &str,
     end: &str,
-) -> Result<Vec<VEvent>, String> {
+    window: (NaiveDate, NaiveDate),
+    source: &str,
+    seen: &mut BTreeSet<(String, Option<String>, String)>,
+    events: &mut BTreeMap<String, RemoteEvent>,
+) -> Result<(), String> {
     // Server-side expansion first: recurrences come back as concrete
     // instances in UTC, so no RRULE or VTIMEZONE handling is needed here.
     let (xml, expanded) =
@@ -577,22 +1033,120 @@ fn fetch_events(
             }
         };
     let doc = roxmltree::Document::parse(&xml).map_err(|e| format!("bad multistatus: {e}"))?;
-    let mut events = Vec::new();
     let mut skipped_rrule = 0usize;
-    for node in doc.descendants().filter(|n| n.tag_name().name() == "calendar-data") {
-        let Some(ics) = node.text() else { continue };
-        for ev in parse_ics_events(ics) {
-            if !expanded && ev.has_rrule {
-                skipped_rrule += 1;
-                continue;
-            }
-            events.push(ev);
+    for resp in doc.descendants().filter(|n| n.tag_name().name() == "response") {
+        let href = resp
+            .children()
+            .find(|c| c.tag_name().name() == "href")
+            .and_then(|n| n.text())
+            .unwrap_or_default();
+        let etag = resp
+            .descendants()
+            .find(|n| n.tag_name().name() == "getetag")
+            .and_then(|n| n.text())
+            .unwrap_or_default()
+            .to_string();
+        let Some(ics) = resp
+            .descendants()
+            .find(|n| n.tag_name().name() == "calendar-data")
+            .and_then(|n| n.text())
+        else {
+            continue;
+        };
+        let url = cal.join(href.trim()).map_err(|e| format!("bad href {href:?}: {e}"))?;
+        let vevents = parse_ics_events(ics);
+        // A resource is recurring if it says so, or if expansion produced
+        // more than one dated VEVENT of it.
+        let recurring = vevents.len() > 1
+            || vevents.iter().any(|v| v.has_rrule || v.has_recurrence_id);
+        if !expanded && recurring {
+            skipped_rrule += 1;
+            continue;
         }
+        let Some(uid) = vevents.iter().map(|v| v.uid.clone()).find(|u| !u.is_empty()) else {
+            continue;
+        };
+        let mut instances = Vec::new();
+        for ev in &vevents {
+            event_to_records(ev, window, source, recurring, seen, &mut instances);
+        }
+        events.insert(
+            uid,
+            RemoteEvent { url, etag, recurring, instances, lines: unfold(ics) },
+        );
     }
     if skipped_rrule > 0 {
         log::warn!("{skipped_rrule} recurring event(s) skipped (server refused expansion)");
     }
-    Ok(events)
+    Ok(())
+}
+
+fn put_ics(
+    client: &reqwest::blocking::Client,
+    acc: &Account,
+    url: &reqwest::Url,
+    body: &str,
+    etag: Option<&str>,
+) -> Result<String, String> {
+    let mut req = client
+        .put(url.clone())
+        .basic_auth(&acc.email, Some(&acc.password))
+        .header("Content-Type", "text/calendar; charset=utf-8")
+        .body(body.to_string());
+    req = match etag {
+        Some(e) if !e.is_empty() => req.header("If-Match", e),
+        Some(_) => req,
+        None => req.header("If-None-Match", "*"),
+    };
+    let resp = req.send().map_err(|e| format!("PUT {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("PUT {url}: HTTP {status}"));
+    }
+    let etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !etag.is_empty() {
+        return Ok(etag);
+    }
+    Ok(fetch_etag(client, acc, url).unwrap_or_default())
+}
+
+fn fetch_etag(
+    client: &reqwest::blocking::Client,
+    acc: &Account,
+    url: &reqwest::Url,
+) -> Option<String> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<propfind xmlns="DAV:"><prop><getetag/></prop></propfind>"#;
+    let xml = dav_request(client, acc, "PROPFIND", url, "0", body).ok()?;
+    let doc = roxmltree::Document::parse(&xml).ok()?;
+    doc.descendants()
+        .find(|n| n.tag_name().name() == "getetag")
+        .and_then(|n| n.text())
+        .map(|s| s.to_string())
+}
+
+fn delete_ics(
+    client: &reqwest::blocking::Client,
+    acc: &Account,
+    url: &reqwest::Url,
+    etag: &str,
+) -> Result<(), String> {
+    let mut req = client.delete(url.clone()).basic_auth(&acc.email, Some(&acc.password));
+    if !etag.is_empty() {
+        req = req.header("If-Match", etag);
+    }
+    let resp = req.send().map_err(|e| format!("DELETE {url}: {e}"))?;
+    let status = resp.status();
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!("DELETE {url}: HTTP {status}"))
+    }
 }
 
 // ── iCalendar parsing (the few fields this mirror needs) ──────────────────
@@ -605,6 +1159,7 @@ struct VEvent {
     dtend: Option<DtValue>,
     cancelled: bool,
     has_rrule: bool,
+    has_recurrence_id: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -631,6 +1186,7 @@ fn unfold(ics: &str) -> Vec<String> {
         }
         lines.push(raw.to_string());
     }
+    lines.retain(|l| !l.is_empty());
     lines
 }
 
@@ -647,6 +1203,12 @@ fn split_content_line(line: &str) -> Option<(&str, &str)> {
     None
 }
 
+fn prop_name(line: &str) -> String {
+    split_content_line(line)
+        .map(|(h, _)| h.split(';').next().unwrap_or("").to_ascii_uppercase())
+        .unwrap_or_default()
+}
+
 fn unescape_text(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     let mut chars = v.chars();
@@ -659,6 +1221,20 @@ fn unescape_text(v: &str) -> String {
             Some('n') | Some('N') => out.push(' '),
             Some(other) => out.push(other),
             None => {}
+        }
+    }
+    out
+}
+
+fn escape_text(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ',' => out.push_str("\\,"),
+            ';' => out.push_str("\\;"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
         }
     }
     out
@@ -710,6 +1286,7 @@ fn parse_ics_events(ics: &str) -> Vec<VEvent> {
                     "DTSTART" => ev.dtstart = parse_dt(head, value),
                     "DTEND" => ev.dtend = parse_dt(head, value),
                     "RRULE" | "RDATE" => ev.has_rrule = true,
+                    "RECURRENCE-ID" => ev.has_recurrence_id = true,
                     "STATUS" => ev.cancelled = value.trim().eq_ignore_ascii_case("CANCELLED"),
                     _ => {}
                 }
@@ -717,6 +1294,85 @@ fn parse_ics_events(ics: &str) -> Vec<VEvent> {
         }
     }
     events
+}
+
+/// The DTSTART/DTEND pair for a record: UTC for timed events, DATE for
+/// all-day ones (DTEND exclusive, one day).
+fn ics_span(r: &EventRecord) -> Result<(String, String), String> {
+    let (date, time) = parse_record_time(r)?;
+    if time.is_some() {
+        let (s, e) = record_span(r)?;
+        let fmt = |t: DateTime<Local>| t.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ").to_string();
+        Ok((format!("DTSTART:{}", fmt(s)), format!("DTEND:{}", fmt(e))))
+    } else {
+        let next = date.checked_add_days(Days::new(1)).ok_or("date overflow")?;
+        Ok((
+            format!("DTSTART;VALUE=DATE:{}", date.format("%Y%m%d")),
+            format!("DTEND;VALUE=DATE:{}", next.format("%Y%m%d")),
+        ))
+    }
+}
+
+fn new_vevent(uid: &str, r: &EventRecord) -> Result<String, String> {
+    let now = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let (dtstart, dtend) = ics_span(r)?;
+    Ok(format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//cce//cce-calendar-sync//EN\r\n\
+         BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:{now}\r\nCREATED:{now}\r\n{dtstart}\r\n{dtend}\r\n\
+         SUMMARY:{}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        escape_text(&r.title)
+    ))
+}
+
+/// Rewrite only SUMMARY, DTSTART and DTEND (and drop a DURATION, which
+/// DTEND supersedes) inside the first VEVENT, leaving every other property
+/// — VALARM, X-APPLE-*, DESCRIPTION — exactly as the server sent it.
+fn patch_vevent(lines: &[String], r: &EventRecord) -> Result<String, String> {
+    let (dtstart, dtend) = ics_span(r)?;
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 3);
+    let mut in_event = false;
+    let mut patched = false;
+    for line in lines {
+        let name = prop_name(line);
+        let value = split_content_line(line).map(|(_, v)| v).unwrap_or_default();
+        if name == "BEGIN" && value.eq_ignore_ascii_case("VEVENT") && !patched {
+            in_event = true;
+            out.push(line.clone());
+            continue;
+        }
+        if in_event && name == "END" && value.eq_ignore_ascii_case("VEVENT") {
+            out.push(format!("SUMMARY:{}", escape_text(&r.title)));
+            out.push(dtstart.clone());
+            out.push(dtend.clone());
+            in_event = false;
+            patched = true;
+            out.push(line.clone());
+            continue;
+        }
+        if in_event && matches!(name.as_str(), "SUMMARY" | "DTSTART" | "DTEND" | "DURATION") {
+            continue;
+        }
+        out.push(line.clone());
+    }
+    if !patched {
+        return Err("no VEVENT to patch".into());
+    }
+    let mut s = out.join("\r\n");
+    s.push_str("\r\n");
+    Ok(s)
+}
+
+/// Random-enough UID from the kernel, no uuid dependency.
+fn new_uid() -> String {
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .is_err()
+    {
+        return format!("CCE-{}", Utc::now().format("%Y%m%dT%H%M%S%fZ"));
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    format!("CCE-{}-{}-{}", &hex[..8], &hex[8..16], &hex[16..])
 }
 
 // ── VEvent → records ──────────────────────────────────────────────────────
@@ -748,6 +1404,7 @@ fn event_to_records(
     ev: &VEvent,
     window: (NaiveDate, NaiveDate),
     source: &str,
+    recurring: bool,
     seen: &mut BTreeSet<(String, Option<String>, String)>,
     out: &mut Vec<EventRecord>,
 ) {
@@ -773,6 +1430,7 @@ fn event_to_records(
                 title: title.clone(),
                 uid: uid.clone(),
                 source: Some(source.to_string()),
+                recurring,
             });
         }
     };
@@ -781,7 +1439,9 @@ fn event_to_records(
         (date, Some(time)) => push(date, Some(time)),
         (start, None) => {
             // All-day: DTEND is exclusive per RFC 5545; a missing one means
-            // a single day. One untimed record per covered day.
+            // a single day. One untimed record per covered day. A multi-day
+            // all-day event is several records of one uid, which the file
+            // cannot edit as one thing — so it is mirrored read-only too.
             let end = match ev.dtend.as_ref().map(to_local) {
                 Some((d, _)) if d > start => d,
                 _ => start.checked_add_days(Days::new(1)).unwrap_or(start),
@@ -798,36 +1458,18 @@ fn event_to_records(
     }
 }
 
-// ── Merge ─────────────────────────────────────────────────────────────────
-
-/// Replace each synced source's records wholesale; everything else — local
-/// events and sources not synced this run — passes through untouched.
-fn merge(existing: Vec<EventRecord>, synced: &[(String, Vec<EventRecord>)]) -> Vec<EventRecord> {
-    let replaced: Vec<&str> = synced.iter().map(|(s, _)| s.as_str()).collect();
-    let mut merged: Vec<EventRecord> = existing
-        .into_iter()
-        .filter(|r| !r.source.as_deref().is_some_and(|s| replaced.contains(&s)))
-        .collect();
-    for (_, records) in synced {
-        merged.extend(records.iter().cloned());
-    }
-    merged.sort_by(|a, b| {
-        (&a.date, a.time.is_none(), &a.time, &a.title).cmp(&(&b.date, b.time.is_none(), &b.time, &b.title))
-    });
-    merged
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn record(date: &str, source: Option<&str>, title: &str) -> EventRecord {
+    fn record(date: &str, time: Option<&str>, title: &str) -> EventRecord {
         EventRecord {
             date: date.into(),
-            time: None,
+            time: time.map(String::from),
             title: title.into(),
             uid: None,
-            source: source.map(String::from),
+            source: None,
+            recurring: false,
         }
     }
 
@@ -845,7 +1487,7 @@ mod tests {
         assert_eq!(events[0].uid, "abc");
         assert_eq!(events[0].summary, "Dentist, checkup");
         assert!(matches!(events[0].dtstart, Some(DtValue::Utc(_))));
-        assert!(!events[0].has_rrule);
+        assert!(!events[0].has_rrule && !events[0].has_recurrence_id);
     }
 
     #[test]
@@ -862,7 +1504,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 12, 1).unwrap(),
         );
         let (mut seen, mut out) = (BTreeSet::new(), Vec::new());
-        event_to_records(&ev, window, "icloud:x", &mut seen, &mut out);
+        event_to_records(&ev, window, "icloud:x", false, &mut seen, &mut out);
         assert_eq!(
             out.iter().map(|r| r.date.as_str()).collect::<Vec<_>>(),
             vec!["2026-09-10", "2026-09-11", "2026-09-12"]
@@ -879,20 +1521,56 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(),
         );
-        event_to_records(ev, window, "s", &mut seen, &mut out);
+        event_to_records(ev, window, "s", false, &mut seen, &mut out);
         assert!(out.is_empty());
     }
 
     #[test]
-    fn merge_replaces_own_source_and_keeps_the_rest() {
-        let existing = vec![
-            record("2026-09-01", None, "hand-entered"),
-            record("2026-09-02", Some("icloud:a@icloud.com"), "stale"),
-            record("2026-09-03", Some("icloud:other@me.com"), "foreign"),
-        ];
-        let fresh = vec![record("2026-09-04", Some("icloud:a@icloud.com"), "fresh")];
-        let merged = merge(existing, &[("icloud:a@icloud.com".to_string(), fresh)]);
-        let titles: Vec<_> = merged.iter().map(|r| r.title.as_str()).collect();
-        assert_eq!(titles, vec!["hand-entered", "foreign", "fresh"]);
+    fn new_vevent_all_day_and_timed() {
+        let all_day = new_vevent("U1", &record("2026-09-10", None, "Trip, day")).unwrap();
+        assert!(all_day.contains("DTSTART;VALUE=DATE:20260910"));
+        assert!(all_day.contains("DTEND;VALUE=DATE:20260911"));
+        assert!(all_day.contains("SUMMARY:Trip\\, day"));
+        let timed = new_vevent("U2", &record("2026-09-10", Some("09:30"), "Call")).unwrap();
+        // UTC form, an hour long; the exact hour depends on the local zone.
+        assert!(timed.contains("DTSTART:20260910T") || timed.contains("DTSTART:20260911T"));
+        assert!(timed.contains("Z\r\nDTEND:"));
+    }
+
+    #[test]
+    fn patch_keeps_foreign_properties_and_replaces_the_span() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u\r\nDTSTART;TZID=America/New_York:20261001T090000\r\nDURATION:PT30M\r\nSUMMARY:old\r\nBEGIN:VALARM\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nX-APPLE-TRAVEL:1\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let patched = patch_vevent(&unfold(ics), &record("2026-10-02", None, "new")).unwrap();
+        assert!(patched.contains("BEGIN:VALARM"));
+        assert!(patched.contains("X-APPLE-TRAVEL:1"));
+        assert!(patched.contains("SUMMARY:new"));
+        assert!(patched.contains("DTSTART;VALUE=DATE:20261002"));
+        assert!(!patched.contains("SUMMARY:old"));
+        assert!(!patched.contains("DURATION"));
+        assert!(!patched.contains("TZID"));
+    }
+
+    #[test]
+    fn google_body_shapes() {
+        let all_day = google_body(&record("2026-09-10", None, "x")).unwrap();
+        assert_eq!(all_day["start"]["date"], "2026-09-10");
+        assert_eq!(all_day["end"]["date"], "2026-09-11");
+        let timed = google_body(&record("2026-09-10", Some("09:30"), "x")).unwrap();
+        assert!(timed["start"]["dateTime"].as_str().unwrap().starts_with("2026-09-10T09:30:00"));
+    }
+
+    #[test]
+    fn synced_event_matches_on_the_editable_triple() {
+        let s = SyncedEvent {
+            source: "icloud:a".into(),
+            url: "u".into(),
+            etag: "e".into(),
+            date: "2026-09-10".into(),
+            time: Some("09:30".into()),
+            title: "x".into(),
+        };
+        assert!(s.matches(&record("2026-09-10", Some("09:30"), "x")));
+        assert!(!s.matches(&record("2026-09-10", Some("10:30"), "x")));
+        assert!(!s.matches(&record("2026-09-10", Some("09:30"), "y")));
     }
 }

@@ -32,6 +32,10 @@ use cce_ui::scene::paint::{AlignH, AlignV, DisplayList, PaintCtx, TextAttrs, Tex
 use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, ScrollPhase};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 
+/// How often events.json is re-stat'd. The runner wakes an idle app once a
+/// second anyway; `idle_poll_interval` pins that rather than inheriting it.
+const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
 const HEADER_H: f32 = 46.0;
 const WEEKDAY_H: f32 = 24.0;
 const SIDEBAR_W: f32 = 300.0;
@@ -212,7 +216,11 @@ struct CalendarApp {
     /// events.json as last read: mtime, polled once a second so the sync's
     /// rewrites (pushed identities, phone-side changes) show up live.
     file_mtime: Option<std::time::SystemTime>,
-    watch_timer: f32,
+    /// When the mtime check below may run again. A wall clock, not an
+    /// accumulation of `tick`'s `dt`: `dt` is animation time, clamped to one
+    /// frame after an idle sleep, and a calendar nobody is touching is idle —
+    /// so the "once a second" watch actually ran about once a minute.
+    watch_at: std::time::Instant,
 }
 
 fn file_mtime() -> Option<std::time::SystemTime> {
@@ -646,7 +654,7 @@ impl Application for CalendarApp {
             month_wheel_px: 0.0,
             status: None,
             file_mtime: file_mtime(),
-            watch_timer: 0.0,
+            watch_at: std::time::Instant::now(),
         }
     }
 
@@ -667,6 +675,13 @@ impl Application for CalendarApp {
         }
     }
 
+    /// The mtime watch in `tick` is work the runner cannot see — nothing
+    /// redraws until the file changes underneath us — so name the cadence the
+    /// loop has to come back at.
+    fn idle_poll_interval(&self) -> Option<std::time::Duration> {
+        Some(WATCH_EVERY)
+    }
+
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
         let now = Local::now().date_naive();
         if now != self.today {
@@ -678,9 +693,9 @@ impl Application for CalendarApp {
         }
         // The sync timer rewrites events.json; pick that up without a
         // relaunch — but not mid-typing, which a reload would clobber.
-        self.watch_timer += dt;
-        if self.watch_timer >= 1.0 {
-            self.watch_timer = 0.0;
+        let now_i = std::time::Instant::now();
+        if now_i >= self.watch_at {
+            self.watch_at = now_i + WATCH_EVERY;
             if self.input.is_none() && file_mtime() != self.file_mtime {
                 self.reload();
                 *needs_rebuild = true;

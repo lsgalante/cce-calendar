@@ -39,7 +39,7 @@ const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 const HEADER_H: f32 = 46.0;
 const WEEKDAY_H: f32 = 24.0;
 const SIDEBAR_W: f32 = 300.0;
-const PAD: f32 = 12.0;
+const PAD: f32 = 12.0; // TODO(style): root_plate_inset()
 const ROW_H: f32 = 36.0;
 const INPUT_H: f32 = 40.0;
 /// Trackpad travel per month step over the grid (a wheel notch is one step).
@@ -811,7 +811,8 @@ impl Application for CalendarApp {
         self.win = (size.width, size.height);
         let g = self.geom();
         let mut pc = PaintCtx::new();
-        pc.quad(Rect { x: 0.0, y: 0.0, width: size.width, height: size.height }, BG);
+        // The standard root plate (cce-ui PlateSpec::window).
+        pc.root_plate(size.width, size.height);
         self.paint_header(&mut pc, &g);
         self.paint_grid(&mut pc, &g);
         self.paint_sidebar(&mut pc, &g);

@@ -27,8 +27,10 @@ use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
 use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::layout::{bevel_width, plate_gap, plate_padding, root_plate_gap, root_plate_inset};
 use cce_ui::scene::layout::Rect;
-use cce_ui::scene::paint::{AlignH, AlignV, DisplayList, PaintCtx, TextAttrs, TextLayout};
+use cce_ui::scene::paint::{AlignH, AlignV, DisplayList, PaintCtx, PlateSpec, TextAttrs, TextLayout};
+use cce_ui::scene::Material;
 use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, ScrollPhase};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 
@@ -39,9 +41,11 @@ const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 const HEADER_H: f32 = 46.0;
 const WEEKDAY_H: f32 = 24.0;
 const SIDEBAR_W: f32 = 300.0;
-const PAD: f32 = 12.0; // TODO(style): root_plate_inset()
 const ROW_H: f32 = 36.0;
 const INPUT_H: f32 = 40.0;
+/// The sidebar's heading block: the day's name on one line, "today" under
+/// it. Two text lines, so a size, not a spacing.
+const SIDEBAR_HEAD_H: f32 = 40.0;
 /// Trackpad travel per month step over the grid (a wheel notch is one step).
 const MONTH_STEP_PX: f32 = 48.0;
 
@@ -176,6 +180,8 @@ fn weekday_offset(day: Weekday, week_start: Weekday) -> u32 {
 
 /// The window geometry every frame and every hit-test derive from.
 struct Geom {
+    /// The month header band across the top of the grid column.
+    header: Rect,
     prev_btn: Rect,
     next_btn: Rect,
     today_btn: Rect,
@@ -183,6 +189,12 @@ struct Geom {
     cell_w: f32,
     cell_h: f32,
     sidebar: Rect,
+    /// The event list's clip inside the sidebar plate: full plate width,
+    /// between the heading block and the bottom strip.
+    list: Rect,
+    /// The bottom strip inside the sidebar plate — the input field while
+    /// typing, else the key hints.
+    strip: Rect,
     /// Date of the grid's top-left cell (always a 42-day window).
     first_day: NaiveDate,
 }
@@ -230,15 +242,45 @@ fn file_mtime() -> Option<std::time::SystemTime> {
 impl CalendarApp {
     fn geom(&self) -> Geom {
         let (w, h) = self.win;
+        // Everything stands on the root plate `root_plate_inset` in from
+        // the window edge; the grid column and the sidebar plate are
+        // siblings on it, `root_plate_gap` apart:
+        // [inset][header+grid][gap][sidebar][inset].
+        let inset = root_plate_inset();
+        let gap = root_plate_gap();
         let sidebar_w = SIDEBAR_W.min(w * 0.4);
-        let grid_w = w - sidebar_w;
+        let grid_w = (w - 2.0 * inset - gap - sidebar_w).max(0.0);
+        let header = Rect { x: inset, y: inset, width: grid_w, height: HEADER_H };
         let grid = Rect {
-            x: 0.0,
-            y: HEADER_H + WEEKDAY_H,
+            x: inset,
+            y: header.y + HEADER_H + WEEKDAY_H,
             width: grid_w,
-            height: h - HEADER_H - WEEKDAY_H,
+            height: (h - inset - (header.y + HEADER_H + WEEKDAY_H)).max(0.0),
         };
-        let btn = |x: f32| Rect { x, y: (HEADER_H - 28.0) / 2.0, width: 28.0, height: 28.0 };
+        let btn = |x: f32| Rect { x, y: header.y + (HEADER_H - 28.0) / 2.0, width: 28.0, height: 28.0 };
+        let sidebar = Rect {
+            x: header.x + grid_w + gap,
+            y: inset,
+            width: sidebar_w,
+            height: (h - 2.0 * inset).max(0.0),
+        };
+        // Inside the sidebar plate: `plate_padding` off its rim, the
+        // heading block, the list and the bottom strip `plate_gap` apart.
+        let pad = plate_padding();
+        let strip_h = INPUT_H - 8.0;
+        let strip = Rect {
+            x: sidebar.x + pad,
+            y: sidebar.y + sidebar.height - pad - strip_h,
+            width: (sidebar.width - 2.0 * pad).max(0.0),
+            height: strip_h,
+        };
+        let list_y = sidebar.y + pad + SIDEBAR_HEAD_H + plate_gap();
+        let list = Rect {
+            x: sidebar.x,
+            y: list_y,
+            width: sidebar.width,
+            height: (strip.y - plate_gap() - list_y).max(0.0),
+        };
         let first_of_month = NaiveDate::from_ymd_opt(self.view.0, self.view.1, 1)
             .unwrap_or(self.today);
         let back = weekday_offset(first_of_month.weekday(), self.week_start);
@@ -246,18 +288,22 @@ impl CalendarApp {
             .checked_sub_days(Days::new(back as u64))
             .unwrap_or(first_of_month);
         Geom {
-            prev_btn: btn(PAD),
-            next_btn: btn(PAD + 28.0 + 190.0),
+            header,
+            prev_btn: btn(header.x),
+            // 190 is the month title's width between the two arrows.
+            next_btn: btn(header.x + 28.0 + 190.0),
             today_btn: Rect {
-                x: grid_w - PAD - 64.0,
-                y: (HEADER_H - 24.0) / 2.0,
+                x: header.x + header.width - 64.0,
+                y: header.y + (HEADER_H - 24.0) / 2.0,
                 width: 64.0,
                 height: 24.0,
             },
             grid,
             cell_w: grid.width / 7.0,
             cell_h: grid.height / 6.0,
-            sidebar: Rect { x: grid_w, y: 0.0, width: sidebar_w, height: h },
+            sidebar,
+            list,
+            strip,
             first_day,
         }
     }
@@ -284,7 +330,7 @@ impl CalendarApp {
     /// How far the selected day's event rows overflow the sidebar's list area.
     fn sidebar_overflow(&self, g: &Geom) -> f32 {
         let events = self.events.get(&self.selected).map_or(0, Vec::len);
-        (events as f32 * ROW_H - (g.sidebar.height - 58.0 - INPUT_H - 8.0)).max(0.0)
+        (events as f32 * ROW_H - g.list.height).max(0.0)
     }
 
     /// Per-frame sidebar glide/coast; true while `sidebar_scroll` is still
@@ -453,7 +499,7 @@ impl CalendarApp {
         }
         let title = Rect {
             x: g.prev_btn.x + g.prev_btn.width,
-            y: 0.0,
+            y: g.header.y,
             width: g.next_btn.x - (g.prev_btn.x + g.prev_btn.width),
             height: HEADER_H,
         };
@@ -473,7 +519,7 @@ impl CalendarApp {
         {
             let rect = Rect {
                 x: g.grid.x + i as f32 * g.cell_w,
-                y: HEADER_H,
+                y: g.header.y + g.header.height,
                 width: g.cell_w,
                 height: WEEKDAY_H,
             };
@@ -494,6 +540,10 @@ impl CalendarApp {
             if !in_month {
                 pc.quad(cell, BG_OTHER_MONTH);
             }
+            // style: deliberate — the cells are hairline-separated grid
+            // cells, not plates: the selection ring sits 1px inside the
+            // cell with a 2px band, and the day number, dots and chips are
+            // tight typographic offsets, not ladder spacings.
             if date == self.selected {
                 let r = Rect {
                     x: cell.x + 1.0,
@@ -556,18 +606,32 @@ impl CalendarApp {
 
     /// Sidebar event-row rects, matching `paint_sidebar` (shared with hit-testing).
     fn sidebar_row(&self, g: &Geom, idx: usize) -> Rect {
+        let pad = plate_padding();
         Rect {
-            x: g.sidebar.x + PAD,
-            y: 64.0 + idx as f32 * ROW_H - self.sidebar_scroll,
-            width: g.sidebar.width - 2.0 * PAD,
+            x: g.sidebar.x + pad,
+            y: g.list.y + idx as f32 * ROW_H - self.sidebar_scroll,
+            width: (g.sidebar.width - 2.0 * pad).max(0.0),
+            // style: deliberate — a 4px hairline between rows in a list,
+            // not a rung gap.
             height: ROW_H - 4.0,
         }
     }
 
     fn paint_sidebar(&self, pc: &mut PaintCtx, g: &Geom) {
-        pc.quad(g.sidebar, SIDEBAR_BG);
-        pc.quad(Rect { x: g.sidebar.x, y: 0.0, width: 1.0, height: g.sidebar.height }, GRID_LINE);
+        // The sidebar is a pane plate standing on the root plate, in the
+        // app's own colour (the DE pane material would swallow this app's
+        // faint text). Inset from every window edge, so no corner is on
+        // the silhouette; the flags are derived anyway so a future
+        // edge-to-edge layout rounds correctly.
+        let (w, h) = self.win;
+        pc.plate_spec(&PlateSpec {
+            rect: g.sidebar,
+            material: Material::opaque(SIDEBAR_BG),
+            window_corners: PlateSpec::window_corner_flags(g.sidebar, w, h),
+            depth: bevel_width(),
+        });
 
+        let pad = plate_padding();
         let heading = format!(
             "{}, {} {}",
             WEEKDAYS[self.selected.weekday().num_days_from_monday() as usize],
@@ -575,22 +639,20 @@ impl CalendarApp {
             self.selected.day()
         );
         let color = if self.selected == self.today { TEXT_ACCENT } else { TEXT };
-        pc.text(heading, g.sidebar.x + PAD, 18.0, 14.0, color);
+        let head_y = g.sidebar.y + pad;
+        pc.text(heading, g.sidebar.x + pad, head_y, 14.0, color);
         if self.selected == self.today {
-            pc.text("today", g.sidebar.x + PAD, 38.0, 10.5, TEXT_FAINT);
+            // The heading block's second line (a line advance, not a gap).
+            pc.text("today", g.sidebar.x + pad, head_y + 20.0, 10.5, TEXT_FAINT);
         }
 
         let events = self.events.get(&self.selected).map(Vec::as_slice).unwrap_or(&[]);
-        let bottom_h = INPUT_H + 8.0;
-        let list = Rect {
-            x: g.sidebar.x,
-            y: 58.0,
-            width: g.sidebar.width,
-            height: g.sidebar.height - 58.0 - bottom_h,
-        };
-        pc.clip(list, |pc| {
+        // style: deliberate — the text offsets inside a row and inside the
+        // strip (+8/+9/+12/+54, the -4/-8 clip margins) are a control's own
+        // text insets, not ladder spacings.
+        pc.clip(g.list, |pc| {
             if events.is_empty() {
-                pc.text("No events", g.sidebar.x + PAD, 70.0, 12.0, TEXT_FAINT);
+                pc.text("No events", g.sidebar.x + pad, g.list.y + 9.0, 12.0, TEXT_FAINT);
             }
             for (i, e) in events.iter().enumerate() {
                 let row = self.sidebar_row(g, i);
@@ -606,12 +668,7 @@ impl CalendarApp {
         });
 
         // Bottom strip: the input field while typing, else the key hints.
-        let strip = Rect {
-            x: g.sidebar.x + PAD,
-            y: g.sidebar.height - bottom_h,
-            width: g.sidebar.width - 2.0 * PAD,
-            height: INPUT_H - 8.0,
-        };
+        let strip = g.strip;
         if let Some(buffer) = &self.input {
             pc.rounded_rect(strip, 6.0, (true, true, true, true), [0.0, 0.0, 0.0, 0.35]);
             pc.rounded_rect(

@@ -28,16 +28,19 @@ use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
 use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
-use cce_ui::colors::{button_background_color, button_hover_color, button_press_color, control_label_color_u8};
+use cce_ui::colors::{
+    button_background_color, button_hover_color, button_press_color, control_label_color_u8, list_font_color,
+};
 use cce_ui::layout::{
-    bevel_width, button_corner_radius, button_font, button_height, carve_inside, parse_font_string,
-    plate_corner_radius, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
+    align_text_y, bevel_width, button_corner_radius, button_font, button_height, carve_inside, list_font,
+    list_font_parsed, parse_font_string, plate_corner_radius, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
 };
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{AlignH, AlignV, ControlPlate, DisplayList, PaintCtx, PlateStance, TextAttrs, TextLayout};
 use cce_ui::scene::Material;
+use cce_ui::widget::display::measure_text_width;
 use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, ScrollPhase};
-use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
+use cce_ui::widget::{Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Paint};
 
 /// How often events.json is re-stat'd. The runner wakes an idle app once a
 /// second anyway; `idle_poll_interval` pins that rather than inheriting it.
@@ -64,7 +67,6 @@ const ACCENT: [f32; 4] = [0.22, 0.42, 0.85, 1.0];
 const EVENT_DOT: [f32; 4] = [0.95, 0.72, 0.30, 1.0];
 /// Dot for events mirrored from a remote calendar (`source` set).
 const SYNC_DOT: [f32; 4] = [0.42, 0.68, 0.95, 1.0];
-const ROW_SEL: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
 const TEXT: [u8; 3] = [225, 228, 232];
 const TEXT_DIM: [u8; 3] = [140, 145, 152];
 const TEXT_FAINT: [u8; 3] = [95, 100, 108];
@@ -274,6 +276,8 @@ struct CalendarApp {
     /// The header button under the pointer, and the one held down.
     hover_btn: Option<HeaderBtn>,
     pressed_btn: Option<HeaderBtn>,
+    /// The day view's event row under the pointer.
+    hover_row: Option<usize>,
     /// events.json as last read: mtime, polled once a second so the sync's
     /// rewrites (pushed identities, phone-side changes) show up live.
     file_mtime: Option<std::time::SystemTime>,
@@ -373,6 +377,25 @@ impl CalendarApp {
             .into_iter()
             .find(|(_, r)| hit(r, x, y))
             .map(|(b, _)| b)
+    }
+
+    /// The selected day's event row at (x, y), if any — only inside the
+    /// list's clip, so a row scrolled under the heading or strip is not hit.
+    fn row_at(&self, g: &Geom, x: f32, y: f32) -> Option<usize> {
+        if !hit(&g.list, x, y) {
+            return None;
+        }
+        let events = self.events.get(&self.selected).map_or(0, Vec::len);
+        (0..events).find(|&i| hit(&self.sidebar_row(g, i), x, y))
+    }
+
+    /// A row's state wash: the colour cce-ui's list-row Button wears in the
+    /// same state (selected, hovered), asked of the toolkit rather than
+    /// copied, so the rows follow it. Transparent at rest.
+    fn row_wash(&self, i: usize) -> [f32; 4] {
+        let mut row = Button::new_list_row(0.0, 0.0, 0.0, 0.0).with_selected(self.sel_event == Some(i));
+        row.set_hovered(self.hover_row == Some(i));
+        row.color()
     }
 
     fn select(&mut self, date: NaiveDate) {
@@ -718,22 +741,36 @@ impl CalendarApp {
 
         let events = self.events.get(&self.selected).map(Vec::as_slice).unwrap_or(&[]);
         // style: deliberate — the text offsets inside a row and inside the
-        // strip (+8/+9/+12/+54, the -4/-8 clip margins) are a control's own
-        // text insets, not ladder spacings.
+        // strip (+8/+9/+12, the -4/-8 clip margins, the time column's 12px
+        // gutter) are a control's own text insets, not ladder spacings.
+        //
+        // The rows are list rows, drawn as the toolkit's list-row Button
+        // draws one: a state wash at the button radius (`row_wash`), the
+        // text in the list font. The title wears the list font colour; the
+        // time keeps the accent that says it is timed.
+        let font = list_font();
+        let (family, size) = list_font_parsed();
+        let fc = list_font_color();
+        let title_color = [(fc[0] * 255.0) as u8, (fc[1] * 255.0) as u8, (fc[2] * 255.0) as u8];
+        let time_w = measure_text_width("00:00", &family, size);
+        let radius = button_corner_radius();
         pc.clip(g.list, |pc| {
             if events.is_empty() {
-                pc.text("No events", g.sidebar.x + pad, g.list.y + 9.0, 12.0, TEXT_FAINT);
+                pc.text_with("No events", g.sidebar.x + pad, g.list.y + 9.0, size, TEXT_FAINT,
+                    Some(font.clone()), None);
             }
             for (i, e) in events.iter().enumerate() {
                 let row = self.sidebar_row(g, i);
-                if self.sel_event == Some(i) {
-                    pc.rounded_rect(row, 5.0, (true, true, true, true), ROW_SEL);
+                let wash = self.row_wash(i);
+                if wash[3] > 0.0 {
+                    pc.rounded_rect(row, radius, (true, true, true, true), wash);
                 }
+                let ty = align_text_y(row.y, row.height, size, 0.0);
                 let time = e.time.map_or("——".to_string(), |(h, m)| format!("{h:02}:{m:02}"));
-                pc.text(time, row.x + 8.0, row.y + 9.0, 11.0,
-                    if e.time.is_some() { TEXT_ACCENT } else { TEXT_FAINT });
-                pc.text_with(e.title.clone(), row.x + 54.0, row.y + 8.0, 12.5, TEXT, None,
-                    Some([row.x, row.y, row.x + row.width - 4.0, row.y + row.height]));
+                pc.text_with(time, row.x + 8.0, ty, size,
+                    if e.time.is_some() { TEXT_ACCENT } else { TEXT_FAINT }, Some(font.clone()), None);
+                pc.text_with(e.title.clone(), row.x + 8.0 + time_w + 12.0, ty, size, title_color,
+                    Some(font.clone()), Some([row.x, row.y, row.x + row.width - 4.0, row.y + row.height]));
             }
         });
 
@@ -782,6 +819,7 @@ impl Application for CalendarApp {
             status: None,
             hover_btn: None,
             pressed_btn: None,
+            hover_row: None,
             file_mtime: file_mtime(),
             watch_at: std::time::Instant::now(),
         }
@@ -837,9 +875,12 @@ impl Application for CalendarApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
-        let hover = Self::header_btn_at(&self.geom(), pos.x, pos.y);
-        if hover != self.hover_btn {
+        let g = self.geom();
+        let hover = Self::header_btn_at(&g, pos.x, pos.y);
+        let row = self.row_at(&g, pos.x, pos.y);
+        if hover != self.hover_btn || row != self.hover_row {
             self.hover_btn = hover;
+            self.hover_row = row;
             *needs_rebuild = true;
         }
     }
@@ -873,8 +914,7 @@ impl Application for CalendarApp {
         } else if let Some(date) = self.day_at(&g, x, y) {
             self.select(date);
         } else if hit(&g.sidebar, x, y) {
-            let events = self.events.get(&self.selected).map_or(0, Vec::len);
-            self.sel_event = (0..events).find(|&i| hit(&self.sidebar_row(&g, i), x, y));
+            self.sel_event = self.row_at(&g, x, y);
         } else {
             return None;
         }

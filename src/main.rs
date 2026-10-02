@@ -28,12 +28,14 @@ use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
 use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::colors::{button_background_color, button_hover_color, button_press_color, control_label_color_u8};
 use cce_ui::layout::{
-    bevel_width, carve_inside, plate_corner_radius, plate_gap, plate_padding, root_plate_gap,
-    root_plate_inset,
+    bevel_width, button_corner_radius, button_font, button_height, carve_inside, parse_font_string,
+    plate_corner_radius, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
 };
 use cce_ui::scene::layout::Rect;
-use cce_ui::scene::paint::{AlignH, AlignV, DisplayList, PaintCtx, TextAttrs, TextLayout};
+use cce_ui::scene::paint::{AlignH, AlignV, ControlPlate, DisplayList, PaintCtx, PlateStance, TextAttrs, TextLayout};
+use cce_ui::scene::Material;
 use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, ScrollPhase};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 
@@ -67,6 +69,19 @@ const TEXT: [u8; 3] = [225, 228, 232];
 const TEXT_DIM: [u8; 3] = [140, 145, 152];
 const TEXT_FAINT: [u8; 3] = [95, 100, 108];
 const TEXT_ACCENT: [u8; 3] = [120, 165, 255];
+
+/// The month header's three buttons, for hover and press tracking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderBtn {
+    Prev,
+    Next,
+    Today,
+}
+
+/// The "Today" button's width; the arrows are square at the button height.
+const TODAY_BTN_W: f32 = 64.0;
+/// The month title's width between the two arrows.
+const TITLE_W: f32 = 190.0;
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -256,6 +271,9 @@ struct CalendarApp {
     /// pixel event. Cleared by a wheel notch and by the finger lift.
     month_wheel_px: f32,
     status: Option<String>,
+    /// The header button under the pointer, and the one held down.
+    hover_btn: Option<HeaderBtn>,
+    pressed_btn: Option<HeaderBtn>,
     /// events.json as last read: mtime, polled once a second so the sync's
     /// rewrites (pushed identities, phone-side changes) show up live.
     file_mtime: Option<std::time::SystemTime>,
@@ -288,7 +306,8 @@ impl CalendarApp {
             width: grid_w,
             height: (h - inset - (header.y + HEADER_H + WEEKDAY_H)).max(0.0),
         };
-        let btn = |x: f32| Rect { x, y: header.y + (HEADER_H - 28.0) / 2.0, width: 28.0, height: 28.0 };
+        let btn_h = button_height().min(HEADER_H);
+        let btn = |x: f32, w: f32| Rect { x, y: header.y + (HEADER_H - btn_h) / 2.0, width: w, height: btn_h };
         let sidebar = Rect {
             x: header.x + grid_w + gap,
             y: inset,
@@ -326,15 +345,9 @@ impl CalendarApp {
             .unwrap_or(first_of_month);
         Geom {
             header,
-            prev_btn: btn(header.x),
-            // 190 is the month title's width between the two arrows.
-            next_btn: btn(header.x + 28.0 + 190.0),
-            today_btn: Rect {
-                x: header.x + header.width - 64.0,
-                y: header.y + (HEADER_H - 24.0) / 2.0,
-                width: 64.0,
-                height: 24.0,
-            },
+            prev_btn: btn(header.x, btn_h),
+            next_btn: btn(header.x + btn_h + TITLE_W, btn_h),
+            today_btn: btn(header.x + header.width - TODAY_BTN_W, TODAY_BTN_W),
             grid,
             cell_w,
             cell_h,
@@ -353,6 +366,13 @@ impl CalendarApp {
         let col = ((x - g.col_x(0)).max(0.0) / g.cell_w) as u64;
         let row = ((y - g.row_y(0)).max(0.0) / g.cell_h) as u64;
         g.first_day.checked_add_days(Days::new(row.min(5) * 7 + col.min(6)))
+    }
+
+    fn header_btn_at(g: &Geom, x: f32, y: f32) -> Option<HeaderBtn> {
+        [(HeaderBtn::Prev, g.prev_btn), (HeaderBtn::Next, g.next_btn), (HeaderBtn::Today, g.today_btn)]
+            .into_iter()
+            .find(|(_, r)| hit(r, x, y))
+            .map(|(b, _)| b)
     }
 
     fn select(&mut self, date: NaiveDate) {
@@ -528,13 +548,39 @@ impl CalendarApp {
         }
     }
 
+    /// A header button as cce-ui's Button draws one: a flush control plate
+    /// at the button radius, its face the DE button colour for its state,
+    /// then either a bundled cce-icons glyph (placed as Button's icon face:
+    /// centred, the short side less 8) or, failing that, the label in the
+    /// button font and the control label colour.
+    fn paint_header_btn(&self, pc: &mut PaintCtx, rect: Rect, which: HeaderBtn, icon: Option<&str>, label: &str) {
+        let face = if self.pressed_btn == Some(which) {
+            button_press_color()
+        } else if self.hover_btn == Some(which) {
+            button_hover_color()
+        } else {
+            button_background_color()
+        };
+        let plate = ControlPlate::control(rect, button_corner_radius(), PlateStance::Flush, Material::face(face));
+        pc.control_plate(&plate);
+        if let Some((image, iw, ih)) = icon.and_then(|name| cce_ui::upload_icon(name, 32)) {
+            let s = (rect.width.min(rect.height) - 8.0).max(4.0);
+            let (iw, ih) = (iw as f32, ih as f32);
+            let (dw, dh) = if iw >= ih { (s, s * ih / iw.max(1.0)) } else { (s * iw / ih.max(1.0), s) };
+            let at = Rect { x: rect.x + (rect.width - dw) / 2.0, y: rect.y + (rect.height - dh) / 2.0, width: dw, height: dh };
+            pc.image(image, at, 1.0);
+            return;
+        }
+        let font = button_font();
+        let size = parse_font_string(&font).1.unwrap_or(14.0);
+        pc.text_boxed(label, rect.x, rect.y, size, control_label_color_u8(), Some(font), None,
+            TextAttrs::default(), Self::boxed(rect, AlignH::Center));
+    }
+
     fn paint_header(&self, pc: &mut PaintCtx, g: &Geom) {
         let bold = TextAttrs { italic: false, weight: Some(700) };
-        for (rect, glyph) in [(&g.prev_btn, "‹"), (&g.next_btn, "›")] {
-            pc.rounded_rect(*rect, 6.0, (true, true, true, true), [1.0, 1.0, 1.0, 0.07]);
-            pc.text_boxed(glyph, rect.x, rect.y - 1.0, 18.0, TEXT, None, None, bold,
-                Self::boxed(*rect, AlignH::Center));
-        }
+        self.paint_header_btn(pc, g.prev_btn, HeaderBtn::Prev, Some("chevron-left"), "‹");
+        self.paint_header_btn(pc, g.next_btn, HeaderBtn::Next, Some("chevron-right"), "›");
         let title = Rect {
             x: g.prev_btn.x + g.prev_btn.width,
             y: g.header.y,
@@ -544,9 +590,7 @@ impl CalendarApp {
         let label = format!("{} {}", MONTHS[self.view.1 as usize - 1], self.view.0);
         pc.text_boxed(label, title.x, title.y, 16.0, TEXT, None, None, bold,
             Self::boxed(title, AlignH::Center));
-        pc.rounded_rect(g.today_btn, 6.0, (true, true, true, true), [1.0, 1.0, 1.0, 0.07]);
-        pc.text_boxed("Today", g.today_btn.x, g.today_btn.y, 12.0, TEXT_DIM, None, None,
-            TextAttrs::default(), Self::boxed(g.today_btn, AlignH::Center));
+        self.paint_header_btn(pc, g.today_btn, HeaderBtn::Today, None, "Today");
     }
 
     fn paint_grid(&self, pc: &mut PaintCtx, g: &Geom) {
@@ -736,6 +780,8 @@ impl Application for CalendarApp {
             sidebar_motion: ScrollMotion::new(),
             month_wheel_px: 0.0,
             status: None,
+            hover_btn: None,
+            pressed_btn: None,
             file_mtime: file_mtime(),
             watch_at: std::time::Instant::now(),
         }
@@ -790,7 +836,13 @@ impl Application for CalendarApp {
         self.win = (width, height);
     }
 
-    fn handle_pointer_move(&mut self, _pos: LogicalPosition, _needs_rebuild: &mut bool) {}
+    fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        let hover = Self::header_btn_at(&self.geom(), pos.x, pos.y);
+        if hover != self.hover_btn {
+            self.hover_btn = hover;
+            *needs_rebuild = true;
+        }
+    }
 
     fn handle_mouse_input(
         &mut self,
@@ -799,17 +851,25 @@ impl Application for CalendarApp {
         pos: LogicalPosition,
         needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
-        if button != MouseButton::Left || state != ElementState::Pressed {
+        if button != MouseButton::Left {
+            return None;
+        }
+        if state != ElementState::Pressed {
+            if self.pressed_btn.take().is_some() {
+                *needs_rebuild = true;
+            }
             return None;
         }
         let g = self.geom();
         let (x, y) = (pos.x, pos.y);
-        if hit(&g.prev_btn, x, y) {
-            self.shift_months(-1);
-        } else if hit(&g.next_btn, x, y) {
-            self.shift_months(1);
-        } else if hit(&g.today_btn, x, y) {
-            self.select(self.today);
+        let header_btn = Self::header_btn_at(&g, x, y);
+        self.pressed_btn = header_btn;
+        if let Some(b) = header_btn {
+            match b {
+                HeaderBtn::Prev => self.shift_months(-1),
+                HeaderBtn::Next => self.shift_months(1),
+                HeaderBtn::Today => self.select(self.today),
+            }
         } else if let Some(date) = self.day_at(&g, x, y) {
             self.select(date);
         } else if hit(&g.sidebar, x, y) {

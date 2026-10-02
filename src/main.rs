@@ -36,7 +36,8 @@ use cce_ui::colors::{
 use cce_ui::layout::{
     align_text_y, bevel_width, button_corner_radius, button_font, button_height, carve_inside,
     control_label_font_detached, control_label_font_detached_parsed, control_relief, list_font,
-    list_font_parsed, parse_font_string, plate_corner_radius, textbox_corner_radius, CONTROL_TEXT_INSET, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
+    list_font_parsed, parse_font_string, plate_corner_radius, statusbar_font, statusbar_font_parsed,
+    textbox_corner_radius, CONTROL_TEXT_INSET, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
 };
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{AlignH, AlignV, ControlPlate, DisplayList, PaintCtx, PlateStance, TextAttrs, TextLayout};
@@ -790,15 +791,7 @@ impl CalendarApp {
         if let Some(buffer) = &self.input {
             self.paint_input(pc, strip, buffer);
         } else {
-            let hint = if let Some(err) = &self.status {
-                err.clone()
-            } else if self.sel_event.is_some() {
-                "d delete · n new · t today".to_string()
-            } else {
-                "n new · t today · pgup/pgdn month".to_string()
-            };
-            let color = if self.status.is_some() { [230, 130, 120] } else { TEXT_FAINT };
-            pc.text(hint, strip.x, strip.y + 12.0, 10.5, color);
+            self.paint_hints(pc, strip);
         }
     }
 }
@@ -846,6 +839,62 @@ impl CalendarApp {
         let caret_h = size * 1.15;
         pc.quad(Rect { x: x + advance, y: text_y + (size - caret_h) / 2.0, width: 1.5, height: caret_h },
             [0.80, 0.80, 0.85, 1.0]);
+    }
+}
+
+/// A key hint: the keys (one keycap each) and what they do.
+type Hint = (&'static [&'static str], &'static str);
+
+/// The strip's hints, most useful first: what does not fit is dropped whole.
+/// "today" comes last because the header's Today button already says it.
+const HINTS: [Hint; 3] = [(&["n"], "new"), (&["pgup", "pgdn"], "month"), (&["t"], "today")];
+const HINTS_SELECTED: [Hint; 3] = [(&["d"], "delete"), (&["n"], "new"), (&["t"], "today")];
+
+impl CalendarApp {
+    /// The key hints, or the status message in their place, in the status
+    /// bar font. Each key is a keycap — a raised control plate with no face
+    /// of its own, so the floor shows through between its lit edges — with
+    /// the key in the foreground text colour and the action after it in the
+    /// dim one. Hints run left to right, and one that would overflow the
+    /// strip is skipped whole (a shorter one after it may still fit), so a
+    /// narrow strip loses hints rather than clipping one mid-word.
+    fn paint_hints(&self, pc: &mut PaintCtx, strip: Rect) {
+        let font = statusbar_font();
+        let (_, size) = statusbar_font_parsed();
+        let to_u8 = |c: [f32; 4]| [0, 1, 2].map(|i| (c[i] * 255.0).round() as u8);
+        let text_y = align_text_y(strip.y, strip.height, size, 0.0);
+        if let Some(err) = &self.status {
+            pc.text_with(err.clone(), strip.x, text_y, size, [0xee, 0x5c, 0x5c], Some(font),
+                Some([strip.x, strip.y, strip.x + strip.width, strip.y + strip.height]));
+            return;
+        }
+        // style: deliberate — a keycap's 6px label inset, the 3px between
+        // two caps of one hint, 6px from cap to action and 14px between
+        // hints are a control's own text spacings, not ladder rungs.
+        let cap_h = (size + 8.0).min(strip.height);
+        let cap_y = strip.y + (strip.height - cap_h) / 2.0;
+        let radius = button_corner_radius().min(cap_h / 2.0);
+        let right = strip.x + strip.width;
+        let hints: &[Hint] = if self.sel_event.is_some() { &HINTS_SELECTED } else { &HINTS };
+        let mut x = strip.x;
+        for (keys, action) in hints {
+            let caps: Vec<f32> = keys.iter().map(|k| (shaped_width(k, size, &font) + 12.0).max(cap_h)).collect();
+            let action_w = shaped_width(action, size, &font);
+            let w = caps.iter().sum::<f32>() + 3.0 * (caps.len() - 1) as f32 + 6.0 + action_w;
+            if x + w > right {
+                continue;
+            }
+            for (key, cap_w) in keys.iter().zip(&caps) {
+                let cap = Rect { x, y: cap_y, width: *cap_w, height: cap_h };
+                pc.control_plate(&ControlPlate::control(cap, radius, PlateStance::Raised, None));
+                pc.text_boxed(*key, cap.x, cap.y, size, to_u8(cce_ui::colors::TEXT_FG), Some(font.clone()), None,
+                    TextAttrs::default(), Self::boxed(cap, AlignH::Center));
+                x += cap_w + 3.0;
+            }
+            x += 3.0;
+            pc.text_with(*action, x, text_y, size, to_u8(cce_ui::colors::TEXT_DIM), Some(font.clone()), None);
+            x += action_w + 14.0;
+        }
     }
 }
 

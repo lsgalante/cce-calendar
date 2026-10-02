@@ -27,7 +27,9 @@ use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
 use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
-use cce_ui::layout::{bevel_width, plate_gap, plate_padding, root_plate_gap, root_plate_inset};
+use cce_ui::layout::{
+    bevel_width, plate_corner_radius, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
+};
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{AlignH, AlignV, DisplayList, PaintCtx, PlateSpec, TextAttrs, TextLayout};
 use cce_ui::scene::Material;
@@ -53,6 +55,9 @@ const BG: [f32; 4] = [0.075, 0.08, 0.09, 1.0];
 const BG_OTHER_MONTH: [f32; 4] = [0.06, 0.064, 0.072, 1.0];
 const SIDEBAR_BG: [f32; 4] = [0.10, 0.105, 0.12, 1.0];
 const GRID_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.06];
+/// The grid lines' drawn width. The lines are the grout between rounded
+/// cells, so every crossing carries the cells' corners as concave fillets.
+const GRID_LINE_W: f32 = 2.0;
 const ACCENT: [f32; 4] = [0.22, 0.42, 0.85, 1.0];
 const EVENT_DOT: [f32; 4] = [0.95, 0.72, 0.30, 1.0];
 /// Dot for events mirrored from a remote calendar (`source` set).
@@ -185,9 +190,13 @@ struct Geom {
     prev_btn: Rect,
     next_btn: Rect,
     today_btn: Rect,
+    /// The month grid's frame, outer edge of the outer lines.
     grid: Rect,
+    /// The pitch: one line centre to the next.
     cell_w: f32,
     cell_h: f32,
+    /// A cell face's corner radius — the fillet at every line crossing.
+    cell_radius: f32,
     sidebar: Rect,
     /// The event list's clip inside the sidebar plate: full plate width,
     /// between the heading block and the bottom strip.
@@ -197,6 +206,28 @@ struct Geom {
     strip: Rect,
     /// Date of the grid's top-left cell (always a 42-day window).
     first_day: NaiveDate,
+}
+
+impl Geom {
+    /// Column `col`'s left line centre (`col` 7 is the right frame line).
+    fn col_x(&self, col: u64) -> f32 {
+        self.grid.x + GRID_LINE_W / 2.0 + col as f32 * self.cell_w
+    }
+
+    fn row_y(&self, row: u64) -> f32 {
+        self.grid.y + GRID_LINE_W / 2.0 + row as f32 * self.cell_h
+    }
+
+    /// A cell's face: the pitch box less half a line on every side — the
+    /// rounded pocket the grout leaves.
+    fn cell(&self, row: u64, col: u64) -> Rect {
+        Rect {
+            x: self.col_x(col) + GRID_LINE_W / 2.0,
+            y: self.row_y(row) + GRID_LINE_W / 2.0,
+            width: (self.cell_w - GRID_LINE_W).max(0.0),
+            height: (self.cell_h - GRID_LINE_W).max(0.0),
+        }
+    }
 }
 
 fn hit(r: &Rect, x: f32, y: f32) -> bool {
@@ -281,6 +312,12 @@ impl CalendarApp {
             width: sidebar.width,
             height: (strip.y - plate_gap() - list_y).max(0.0),
         };
+        // Seven pitches plus one line span the frame, so the outer lines
+        // are as wide as the inner ones.
+        let cell_w = ((grid.width - GRID_LINE_W) / 7.0).max(0.0);
+        let cell_h = ((grid.height - GRID_LINE_W) / 6.0).max(0.0);
+        let cell_radius = plate_corner_radius()
+            .min((cell_w.min(cell_h) - GRID_LINE_W).max(0.0) / 4.0);
         let first_of_month = NaiveDate::from_ymd_opt(self.view.0, self.view.1, 1)
             .unwrap_or(self.today);
         let back = weekday_offset(first_of_month.weekday(), self.week_start);
@@ -299,8 +336,9 @@ impl CalendarApp {
                 height: 24.0,
             },
             grid,
-            cell_w: grid.width / 7.0,
-            cell_h: grid.height / 6.0,
+            cell_w,
+            cell_h,
+            cell_radius,
             sidebar,
             list,
             strip,
@@ -312,8 +350,8 @@ impl CalendarApp {
         if !hit(&g.grid, x, y) {
             return None;
         }
-        let col = ((x - g.grid.x) / g.cell_w) as u64;
-        let row = ((y - g.grid.y) / g.cell_h) as u64;
+        let col = ((x - g.col_x(0)).max(0.0) / g.cell_w) as u64;
+        let row = ((y - g.row_y(0)).max(0.0) / g.cell_h) as u64;
         g.first_day.checked_add_days(Days::new(row.min(5) * 7 + col.min(6)))
     }
 
@@ -518,7 +556,7 @@ impl CalendarApp {
             .enumerate()
         {
             let rect = Rect {
-                x: g.grid.x + i as f32 * g.cell_w,
+                x: g.col_x(i as u64),
                 y: g.header.y + g.header.height,
                 width: g.cell_w,
                 height: WEEKDAY_H,
@@ -530,30 +568,21 @@ impl CalendarApp {
         for i in 0..42u64 {
             let Some(date) = g.first_day.checked_add_days(Days::new(i)) else { continue };
             let (row, col) = (i / 7, i % 7);
-            let cell = Rect {
-                x: g.grid.x + col as f32 * g.cell_w,
-                y: g.grid.y + row as f32 * g.cell_h,
-                width: g.cell_w,
-                height: g.cell_h,
-            };
+            let cell = g.cell(row, col);
+            let radius = g.cell_radius;
+            let all = (true, true, true, true);
             let in_month = (date.year(), date.month()) == self.view;
             if !in_month {
-                pc.quad(cell, BG_OTHER_MONTH);
+                pc.rounded_rect(cell, radius, all, BG_OTHER_MONTH);
             }
-            // style: deliberate — the cells are hairline-separated grid
-            // cells, not plates: the selection ring sits 1px inside the
-            // cell with a 2px band, and the day number, dots and chips are
-            // tight typographic offsets, not ladder spacings.
+            // style: deliberate — the cells are grout-separated grid cells,
+            // not plates: the selection ring is a 2px band traced on the
+            // face's own outline (unfilled, so the face shows through), and
+            // the day number, dots and chips are tight typographic offsets,
+            // not ladder spacings.
             if date == self.selected {
-                let r = Rect {
-                    x: cell.x + 1.0,
-                    y: cell.y + 1.0,
-                    width: cell.width - 2.0,
-                    height: cell.height - 2.0,
-                };
-                pc.rounded_rect(r, 5.0, (true, true, true, true), [ACCENT[0], ACCENT[1], ACCENT[2], 0.55]);
-                let inner = Rect { x: r.x + 2.0, y: r.y + 2.0, width: r.width - 4.0, height: r.height - 4.0 };
-                pc.rounded_rect(inner, 4.0, (true, true, true, true), if in_month { BG } else { BG_OTHER_MONTH });
+                pc.border(cell, (radius, radius, radius, radius), [0.0; 4],
+                    [ACCENT[0], ACCENT[1], ACCENT[2], 0.55], 2.0);
             }
 
             // Day number, top-left; today gets an accent pill.
@@ -594,14 +623,15 @@ impl CalendarApp {
             }
         }
 
-        for col in 1..7 {
-            let x = g.grid.x + col as f32 * g.cell_w;
-            pc.quad(Rect { x, y: g.grid.y, width: 1.0, height: g.grid.height }, GRID_LINE);
-        }
-        for row in 0..6 {
-            let y = g.grid.y + row as f32 * g.cell_h;
-            pc.quad(Rect { x: g.grid.x, y, width: g.grid.width, height: 1.0 }, GRID_LINE);
-        }
+        // The lines are grout: one draw paints everything in the frame
+        // outside the rounded cell faces, so each crossing is filleted by
+        // the four corners meeting at it. The frame's own outer corners are
+        // clipped concentric with the corner cells'.
+        let origin = (g.col_x(0) + g.cell_w / 2.0, g.row_y(0) + g.cell_h / 2.0);
+        let face = ((g.cell_w - GRID_LINE_W).max(0.0), (g.cell_h - GRID_LINE_W).max(0.0));
+        pc.clip_rounded(g.grid, g.cell_radius + GRID_LINE_W, |pc| {
+            pc.grout(g.grid, (g.cell_w, g.cell_h), origin, face, g.cell_radius, GRID_LINE);
+        });
     }
 
     /// Sidebar event-row rects, matching `paint_sidebar` (shared with hit-testing).

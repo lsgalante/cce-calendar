@@ -259,9 +259,6 @@ fn shaped_width(text: &str, size: f32, font: &str) -> f32 {
         .map_or(0.0, |&(_, x)| x)
 }
 
-fn hit(r: &Rect, x: f32, y: f32) -> bool {
-    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-}
 
 struct CalendarApp {
     events: BTreeMap<NaiveDate, Vec<Event>>,
@@ -376,7 +373,7 @@ impl CalendarApp {
     }
 
     fn day_at(&self, g: &Geom, x: f32, y: f32) -> Option<NaiveDate> {
-        if !hit(&g.grid, x, y) {
+        if !g.grid.contains(x, y) {
             return None;
         }
         let col = ((x - g.col_x(0)).max(0.0) / g.cell_w) as u64;
@@ -387,18 +384,18 @@ impl CalendarApp {
     fn header_btn_at(g: &Geom, x: f32, y: f32) -> Option<HeaderBtn> {
         [(HeaderBtn::Prev, g.prev_btn), (HeaderBtn::Next, g.next_btn), (HeaderBtn::Today, g.today_btn)]
             .into_iter()
-            .find(|(_, r)| hit(r, x, y))
+            .find(|(_, r)| r.contains(x, y))
             .map(|(b, _)| b)
     }
 
     /// The selected day's event row at (x, y), if any — only inside the
     /// list's clip, so a row scrolled under the heading or strip is not hit.
     fn row_at(&self, g: &Geom, x: f32, y: f32) -> Option<usize> {
-        if !hit(&g.list, x, y) {
+        if !g.list.contains(x, y) {
             return None;
         }
         let events = self.events.get(&self.selected).map_or(0, Vec::len);
-        (0..events).find(|&i| hit(&self.sidebar_row(g, i), x, y))
+        (0..events).find(|&i| self.sidebar_row(g, i).contains(x, y))
     }
 
     /// A row's state wash: the colour cce-ui's list-row Button wears in the
@@ -1012,7 +1009,7 @@ impl Application for CalendarApp {
             }
         } else if let Some(date) = self.day_at(&g, x, y) {
             self.select(date);
-        } else if hit(&g.sidebar, x, y) {
+        } else if g.sidebar.contains(x, y) {
             self.sel_event = self.row_at(&g, x, y);
         } else {
             return None;
@@ -1023,7 +1020,7 @@ impl Application for CalendarApp {
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
         let g = self.geom();
-        if hit(&g.sidebar, pos.x, pos.y) {
+        if g.sidebar.contains(pos.x, pos.y) {
             // A notch is one row, pixel deltas are 1:1. The motion glides
             // notches and coasts a flick; `tick_sidebar_scroll` carries the
             // drawn offset after it. A true return is the repaint signal.

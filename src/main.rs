@@ -29,16 +29,18 @@ use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::colors::{
-    button_background_color, button_hover_color, button_press_color, control_label_color_u8, list_font_color,
+    button_background_color, button_hover_color, button_press_color, control_label_color_u8,
+    highlight_primary_color, list_font_color, textbox_background_color, textbox_placeholder_text_color,
+    well_frame_color,
 };
 use cce_ui::layout::{
-    align_text_y, bevel_width, button_corner_radius, button_font, button_height, carve_inside, list_font,
-    list_font_parsed, parse_font_string, plate_corner_radius, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
+    align_text_y, bevel_width, button_corner_radius, button_font, button_height, carve_inside,
+    control_label_font_detached, control_label_font_detached_parsed, control_relief, list_font,
+    list_font_parsed, parse_font_string, plate_corner_radius, textbox_corner_radius, CONTROL_TEXT_INSET, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
 };
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{AlignH, AlignV, ControlPlate, DisplayList, PaintCtx, PlateStance, TextAttrs, TextLayout};
 use cce_ui::scene::Material;
-use cce_ui::widget::display::measure_text_width;
 use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, ScrollPhase};
 use cce_ui::widget::{Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Paint};
 
@@ -245,6 +247,15 @@ impl Geom {
             height: (self.cell_h - GRID_LINE_W).max(0.0),
         }
     }
+}
+
+/// `text`'s advance in `font` at `size`, shaped as the renderer draws it —
+/// what a caret or a column after the text must be placed by.
+fn shaped_width(text: &str, size: f32, font: &str) -> f32 {
+    let mut fs = cce_ui::geometry_font_system().lock().unwrap_or_else(|e| e.into_inner());
+    cce_ui::backend::window_runner::shaped_cluster_offsets(&mut fs, text, size, Some(font))
+        .last()
+        .map_or(0.0, |&(_, x)| x)
 }
 
 fn hit(r: &Rect, x: f32, y: f32) -> bool {
@@ -749,10 +760,10 @@ impl CalendarApp {
         // text in the list font. The title wears the list font colour; the
         // time keeps the accent that says it is timed.
         let font = list_font();
-        let (family, size) = list_font_parsed();
+        let (_, size) = list_font_parsed();
         let fc = list_font_color();
         let title_color = [(fc[0] * 255.0) as u8, (fc[1] * 255.0) as u8, (fc[2] * 255.0) as u8];
-        let time_w = measure_text_width("00:00", &family, size);
+        let time_w = shaped_width("00:00", size, &font);
         let radius = button_corner_radius();
         pc.clip(g.list, |pc| {
             if events.is_empty() {
@@ -777,14 +788,7 @@ impl CalendarApp {
         // Bottom strip: the input field while typing, else the key hints.
         let strip = g.strip;
         if let Some(buffer) = &self.input {
-            pc.rounded_rect(strip, 6.0, (true, true, true, true), [0.0, 0.0, 0.0, 0.35]);
-            pc.rounded_rect(
-                Rect { x: strip.x, y: strip.y + strip.height - 2.0, width: strip.width, height: 2.0 },
-                1.0, (true, true, true, true), ACCENT);
-            let shown = if buffer.is_empty() { "HH:MM title".to_string() } else { format!("{buffer}▏") };
-            let color = if buffer.is_empty() { TEXT_FAINT } else { TEXT };
-            pc.text_with(shown, strip.x + 8.0, strip.y + 9.0, 12.5, color, None,
-                Some([strip.x, strip.y, strip.x + strip.width - 8.0, strip.y + strip.height]));
+            self.paint_input(pc, strip, buffer);
         } else {
             let hint = if let Some(err) = &self.status {
                 err.clone()
@@ -796,6 +800,52 @@ impl CalendarApp {
             let color = if self.status.is_some() { [230, 130, 120] } else { TEXT_FAINT };
             pc.text(hint, strip.x, strip.y + 12.0, 10.5, color);
         }
+    }
+}
+
+impl CalendarApp {
+    /// The new-event field, drawn as cce-ui's single-line TextBox draws
+    /// itself while editing: the textbox background (skipped when
+    /// transparent, so the floor shows through), a well carved inside the
+    /// strip at the textbox radius with its rim lit in the highlight accent
+    /// (a flat accent frame without relief), the value in the detached
+    /// control-label font at the control text inset, the placeholder in the
+    /// placeholder colour, and a 1.5px caret at the shaped end of the text.
+    /// A value wider than the field scrolls so the caret stays in view.
+    fn paint_input(&self, pc: &mut PaintCtx, strip: Rect, buffer: &str) {
+        let radius = textbox_corner_radius();
+        let radii = (radius, radius, radius, radius);
+        let bg = textbox_background_color();
+        if control_relief() {
+            if bg[3] > 0.001 {
+                pc.rounded_rect(strip, radius, (true, true, true, true), bg);
+            }
+            let depth = bevel_width().min(strip.height * 0.2);
+            let (well, well_radii) = carve_inside(strip, radii, depth);
+            let hc = highlight_primary_color();
+            pc.recess_tinted(well, well_radii, depth, [hc[0], hc[1], hc[2]]);
+        } else {
+            pc.border(strip, radii, bg, well_frame_color(false, true), 1.0);
+        }
+
+        let font = control_label_font_detached();
+        let (_, size) = control_label_font_detached_parsed();
+        let inset = CONTROL_TEXT_INSET;
+        let text_y = align_text_y(strip.y, strip.height, size, 0.0);
+        let clip = [strip.x + inset, strip.y, strip.x + strip.width - inset, strip.y + strip.height];
+        if buffer.is_empty() {
+            pc.text_with("HH:MM title", strip.x + inset, text_y, size, textbox_placeholder_text_color(),
+                Some(font.clone()), Some(clip));
+        }
+        let advance = shaped_width(buffer, size, &font);
+        let scroll = (advance - (strip.width - 2.0 * inset)).max(0.0);
+        let x = strip.x + inset - scroll;
+        if !buffer.is_empty() {
+            pc.text_with(buffer, x, text_y, size, [0xee, 0xee, 0xf5], Some(font), Some(clip));
+        }
+        let caret_h = size * 1.15;
+        pc.quad(Rect { x: x + advance, y: text_y + (size - caret_h) / 2.0, width: 1.5, height: caret_h },
+            [0.80, 0.80, 0.85, 1.0]);
     }
 }
 

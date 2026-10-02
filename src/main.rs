@@ -1,6 +1,7 @@
 //! cce-calendar — month-view calendar with per-day events.
 //!
-//! A 6×7 month grid on the left, a day pane on the right. Events live in
+//! A 6×7 month grid on the left, a day pane (a well in the root plate) on
+//! the right. Events live in
 //! `$XDG_DATA_HOME/cce/calendar/events.json` (one flat list of
 //! date/time/title records) and are saved on every mutation. Records with a
 //! `source` are mirrored from a remote calendar by `cce-calendar-sync`
@@ -28,11 +29,11 @@ use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::layout::{
-    bevel_width, plate_corner_radius, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
+    bevel_width, carve_inside, plate_corner_radius, plate_gap, plate_padding, root_plate_gap,
+    root_plate_inset,
 };
 use cce_ui::scene::layout::Rect;
-use cce_ui::scene::paint::{AlignH, AlignV, DisplayList, PaintCtx, PlateSpec, TextAttrs, TextLayout};
-use cce_ui::scene::Material;
+use cce_ui::scene::paint::{AlignH, AlignV, DisplayList, PaintCtx, TextAttrs, TextLayout};
 use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, ScrollPhase};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 
@@ -53,7 +54,6 @@ const MONTH_STEP_PX: f32 = 48.0;
 
 const BG: [f32; 4] = [0.075, 0.08, 0.09, 1.0];
 const BG_OTHER_MONTH: [f32; 4] = [0.06, 0.064, 0.072, 1.0];
-const SIDEBAR_BG: [f32; 4] = [0.10, 0.105, 0.12, 1.0];
 const GRID_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.06];
 /// The grid lines' drawn width. The lines are the grout between rounded
 /// cells, so every crossing carries the cells' corners as concave fillets.
@@ -198,10 +198,10 @@ struct Geom {
     /// A cell face's corner radius — the fillet at every line crossing.
     cell_radius: f32,
     sidebar: Rect,
-    /// The event list's clip inside the sidebar plate: full plate width,
+    /// The event list's clip inside the sidebar well: full well width,
     /// between the heading block and the bottom strip.
     list: Rect,
-    /// The bottom strip inside the sidebar plate — the input field while
+    /// The bottom strip inside the sidebar well — the input field while
     /// typing, else the key hints.
     strip: Rect,
     /// Date of the grid's top-left cell (always a 42-day window).
@@ -274,7 +274,7 @@ impl CalendarApp {
     fn geom(&self) -> Geom {
         let (w, h) = self.win;
         // Everything stands on the root plate `root_plate_inset` in from
-        // the window edge; the grid column and the sidebar plate are
+        // the window edge; the grid column and the sidebar well are
         // siblings on it, `root_plate_gap` apart:
         // [inset][header+grid][gap][sidebar][inset].
         let inset = root_plate_inset();
@@ -295,7 +295,7 @@ impl CalendarApp {
             width: sidebar_w,
             height: (h - 2.0 * inset).max(0.0),
         };
-        // Inside the sidebar plate: `plate_padding` off its rim, the
+        // Inside the sidebar well: `plate_padding` off its rim, the
         // heading block, the list and the bottom strip `plate_gap` apart.
         let pad = plate_padding();
         let strip_h = INPUT_H - 8.0;
@@ -648,18 +648,14 @@ impl CalendarApp {
     }
 
     fn paint_sidebar(&self, pc: &mut PaintCtx, g: &Geom) {
-        // The sidebar is a pane plate standing on the root plate, in the
-        // app's own colour (the DE pane material would swallow this app's
-        // faint text). Inset from every window edge, so no corner is on
-        // the silhouette; the flags are derived anyway so a future
-        // edge-to-edge layout rounds correctly.
-        let (w, h) = self.win;
-        pc.plate_spec(&PlateSpec {
-            rect: g.sidebar,
-            material: Material::opaque(SIDEBAR_BG),
-            window_corners: PlateSpec::window_corner_flags(g.sidebar, w, h),
-            depth: bevel_width(),
-        });
+        // The day view is a well carved into the root plate, not a plate
+        // standing on it: the floor is the root plate showing through, the
+        // wall kept inside the sidebar rect so the gap to the grid is the
+        // gap. Drawn first so the rows and the strip lie on its floor.
+        let r = plate_corner_radius();
+        let depth = bevel_width().min(g.sidebar.height * 0.2);
+        let (well, radii) = carve_inside(g.sidebar, (r, r, r, r), depth);
+        pc.recess(well, radii, depth);
 
         let pad = plate_padding();
         let heading = format!(

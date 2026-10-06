@@ -584,7 +584,8 @@ impl CalendarApp {
     /// at the button radius, its face the DE button colour for its state,
     /// then either a bundled cce-icons glyph (placed as Button's icon face:
     /// centred, the short side less 8) or, failing that, the label in the
-    /// button font and the control label colour.
+    /// button font and the control label colour — a word, never a symbol
+    /// character, since it shows only when the icon set is missing.
     fn paint_header_btn(&self, pc: &mut PaintCtx, rect: Rect, which: HeaderBtn, icon: Option<&str>, label: &str) {
         let face = if self.pressed_btn == Some(which) {
             button_press_color()
@@ -611,8 +612,8 @@ impl CalendarApp {
 
     fn paint_header(&self, pc: &mut PaintCtx, g: &Geom) {
         let bold = TextAttrs { italic: false, weight: Some(700) };
-        self.paint_header_btn(pc, g.prev_btn, HeaderBtn::Prev, Some("chevron-left"), "‹");
-        self.paint_header_btn(pc, g.next_btn, HeaderBtn::Next, Some("chevron-right"), "›");
+        self.paint_header_btn(pc, g.prev_btn, HeaderBtn::Prev, Some("chevron-left"), "Prev");
+        self.paint_header_btn(pc, g.next_btn, HeaderBtn::Next, Some("chevron-right"), "Next");
         let title = Rect {
             x: g.prev_btn.x + g.prev_btn.width,
             y: g.header.y,

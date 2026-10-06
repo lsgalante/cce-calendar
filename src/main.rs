@@ -834,8 +834,10 @@ impl CalendarApp {
             pc.text_with(buffer, x, text_y, size, [0xee, 0xee, 0xf5], Some(font), Some(clip));
         }
         let caret_h = size * 1.15;
-        pc.quad(Rect { x: x + advance, y: text_y + (size - caret_h) / 2.0, width: 1.5, height: caret_h },
-            [0.80, 0.80, 0.85, 1.0]);
+        let caret = Rect { x: x + advance, y: text_y + (size - caret_h) / 2.0, width: 1.5, height: caret_h };
+        // Open for typing: the on-screen keyboard follows this.
+        cce_ui::text_input::claim(caret.x, caret.y, caret.width, caret.height);
+        pc.quad(caret, [0.80, 0.80, 0.85, 1.0]);
     }
 }
 

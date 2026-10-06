@@ -37,7 +37,7 @@ use cce_ui::layout::{
     align_text_y, bevel_width, button_corner_radius, button_font, button_height, carve_inside,
     control_label_font_detached, control_label_font_detached_parsed, control_relief, list_font,
     list_font_parsed, parse_font_string, plate_corner_radius, statusbar_font, statusbar_font_parsed,
-    textbox_corner_radius, CONTROL_TEXT_INSET, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
+    textbox_corner_radius, textbox_height, CONTROL_TEXT_INSET, plate_gap, plate_padding, root_plate_gap, root_plate_inset,
 };
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{AlignH, AlignV, ControlPlate, DisplayList, PaintCtx, PlateStance, TextAttrs, TextLayout};
@@ -787,7 +787,10 @@ impl CalendarApp {
         // Bottom strip: the input field while typing, else the key hints.
         let strip = g.strip;
         if let Some(buffer) = &self.input {
-            self.paint_input(pc, strip, buffer);
+            // The field at the toolkit's textbox height, centred in the strip.
+            let field_h = textbox_height().min(strip.height);
+            let field = Rect { y: strip.y + (strip.height - field_h) / 2.0, height: field_h, ..strip };
+            self.paint_input(pc, field, buffer);
         } else {
             self.paint_hints(pc, strip);
         }

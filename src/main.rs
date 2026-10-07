@@ -611,7 +611,7 @@ impl CalendarApp {
     }
 
     fn paint_header(&self, pc: &mut PaintCtx, g: &Geom) {
-        let bold = TextAttrs { italic: false, weight: Some(700) };
+        let bold = TextAttrs { italic: false, weight: Some(700), ..Default::default() };
         self.paint_header_btn(pc, g.prev_btn, HeaderBtn::Prev, Some("chevron-left"), "Prev");
         self.paint_header_btn(pc, g.next_btn, HeaderBtn::Next, Some("chevron-right"), "Next");
         let title = Rect {
@@ -675,7 +675,7 @@ impl CalendarApp {
                 TEXT_FAINT
             };
             pc.text_boxed(date.day().to_string(), num.x, num.y, 11.5, num_color, None, None,
-                TextAttrs { italic: false, weight: Some(600) }, Self::boxed(num, AlignH::Center));
+                TextAttrs { italic: false, weight: Some(600), ..Default::default() }, Self::boxed(num, AlignH::Center));
 
             // Event chips: dot + clipped title, then a "+N" overflow line.
             if let Some(events) = self.events.get(&date) {

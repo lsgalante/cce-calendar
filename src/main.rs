@@ -25,9 +25,8 @@ use std::collections::BTreeMap;
 
 use cce_calendar::{load_records, save_records, EventRecord};
 use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
-use wayland_client::QueueHandle;
 
-use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::colors::{
     button_background_color, button_hover_color, button_press_color, control_label_color_u8,
     highlight_primary_color, list_font_color, textbox_background_color, textbox_placeholder_text_color,
@@ -904,7 +903,7 @@ impl CalendarApp {
 impl Application for CalendarApp {
     type Message = Message;
 
-    fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
+    fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
         let today = Local::now().date_naive();
         Self {
             events: load_events(),

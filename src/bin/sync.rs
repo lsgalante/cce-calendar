@@ -42,8 +42,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use cce_calendar::{
-    data_path, load_records, load_sync_state, push_target_config, save_records, save_sync_state,
-    sort_records, EventRecord, PushTarget, SyncState, SyncedEvent,
+    data_path, load_records, load_sync_state, push_target_config, read_accounts, save_records,
+    save_sync_state, sort_records, AccountOnDisk, EventRecord, PushTarget, SyncState, SyncedEvent,
 };
 use chrono::{DateTime, Days, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
@@ -66,13 +66,14 @@ fn main() {
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let force_deletes = args.iter().any(|a| a == "--force-deletes");
 
-    let (icloud, google) = match (icloud_accounts(), google_accounts()) {
-        (Ok(i), Ok(g)) => (i, g),
-        (Err(e), _) | (_, Err(e)) => {
+    let on_disk = match read_accounts() {
+        Ok(a) => a,
+        Err(e) => {
             log::error!("cannot read accounts: {e}");
             std::process::exit(1);
         }
     };
+    let (icloud, google) = (icloud_accounts(&on_disk), google_accounts(&on_disk));
     if icloud.is_empty() && google.is_empty() {
         log::info!("no iCloud or Google (OAuth) accounts in accounts.json; nothing to sync");
         return;
@@ -84,9 +85,11 @@ fn main() {
         today.checked_add_days(Days::new(FUTURE_DAYS)).unwrap_or(today),
     );
 
-    // Typed events go to one calendar; the account kind that owns it.
+    // Typed events go to one calendar: on the named account, else the
+    // first account of the configured kind.
     let push = push_target_config().unwrap_or_else(|| PushTarget {
         kind: if !icloud.is_empty() { "icloud" } else { "google" }.to_string(),
+        account: None,
         calendar: None,
     });
 
@@ -121,9 +124,18 @@ fn main() {
         .map(Backend::ICloud)
         .chain(google.into_iter().map(Backend::Google))
         .collect();
+    let push_to = backends.iter().position(|b| {
+        b.kind() == push.kind && push.account.as_deref().is_none_or(|a| a.eq_ignore_ascii_case(b.email()))
+    });
+    if push.kind != "none" && push_to.is_none() {
+        log::warn!(
+            "push-to {} {}: no such account to sync; typed events stay local",
+            push.kind,
+            push.account.as_deref().unwrap_or("(first)")
+        );
+    }
     for (i, backend) in backends.iter().enumerate() {
-        let push_here = push.kind == backend.kind()
-            && backends.iter().position(|b| b.kind() == push.kind) == Some(i);
+        let push_here = push_to == Some(i);
         match sync_source(backend, window, &push, push_here, &mut records, &mut state, dry_run, force_deletes)
         {
             Ok(()) => synced_any = true,
@@ -508,29 +520,9 @@ struct Account {
     password: String,
 }
 
-/// The subset of cce-mail's AccountInfo this helper needs. Unknown fields
-/// are ignored, so the two readers cannot drift apart.
-#[derive(serde::Deserialize)]
-struct AccountOnDisk {
-    email: String,
-    #[serde(default)]
-    imap: String,
-    #[serde(default)]
-    password: String,
-}
-
-fn icloud_accounts() -> Result<Vec<Account>, String> {
-    let path = cce_ui::config::cce_config_dir().join("accounts.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    let on_disk: Vec<AccountOnDisk> =
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-
+fn icloud_accounts(on_disk: &[AccountOnDisk]) -> Vec<Account> {
     let mut out = Vec::new();
-    for acc in on_disk {
-        if !is_icloud(&acc) {
-            continue;
-        }
+    for acc in on_disk.iter().filter(|a| a.is_icloud()) {
         // Same resolution order as cce-mail: a plaintext on-disk password is
         // still valid pre-migration; an empty one lives in the keyring under
         // the "cce-mail" service. This helper only reads — migration into
@@ -546,15 +538,9 @@ fn icloud_accounts() -> Result<Vec<Account>, String> {
                 }
             }
         };
-        out.push(Account { email: acc.email, password });
+        out.push(Account { email: acc.email.clone(), password });
     }
-    Ok(out)
-}
-
-fn is_icloud(acc: &AccountOnDisk) -> bool {
-    let host = acc.imap.split(':').next().unwrap_or("");
-    host.ends_with(".mail.me.com")
-        || ["@icloud.com", "@me.com", "@mac.com"].iter().any(|d| acc.email.ends_with(d))
+    out
 }
 
 // ── Google (OAuth) ────────────────────────────────────────────────────────
@@ -566,20 +552,6 @@ struct GoogleAccount {
     client_secret: String,
 }
 
-/// The OAuth fields the settings app's Google sign-in writes.
-#[derive(serde::Deserialize)]
-struct OAuthOnDisk {
-    email: String,
-    #[serde(default)]
-    is_oauth: bool,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    client_id: Option<String>,
-    #[serde(default)]
-    client_secret: Option<String>,
-}
-
 #[derive(serde::Deserialize, Default)]
 struct GoogleClientConfig {
     #[serde(default)]
@@ -588,38 +560,28 @@ struct GoogleClientConfig {
     client_secret: String,
 }
 
-fn google_accounts() -> Result<Vec<GoogleAccount>, String> {
-    let dir = cce_ui::config::cce_config_dir();
-    let path = dir.join("accounts.json");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let on_disk: Vec<OAuthOnDisk> =
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+fn google_accounts(on_disk: &[AccountOnDisk]) -> Vec<GoogleAccount> {
     // An account without its own pinned client credentials falls back to
     // the global template the settings app maintains.
-    let template: GoogleClientConfig = std::fs::read_to_string(dir.join("google_client.json"))
+    let template: GoogleClientConfig = std::fs::read_to_string(cce_ui::config::cce_config_dir().join("google_client.json"))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
     let mut out = Vec::new();
-    for acc in on_disk {
-        if !acc.is_oauth {
-            continue;
-        }
-        let Some(refresh_token) = acc.refresh_token.filter(|t| !t.is_empty()) else {
+    for acc in on_disk.iter().filter(|a| a.is_oauth) {
+        if !acc.is_google() {
             log::warn!("{}: OAuth account without a refresh token; sign in again", acc.email);
             continue;
-        };
+        }
+        let pinned = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
         out.push(GoogleAccount {
-            email: acc.email,
-            refresh_token,
-            client_id: acc.client_id.filter(|s| !s.is_empty()).unwrap_or(template.client_id.clone()),
-            client_secret: acc
-                .client_secret
-                .filter(|s| !s.is_empty())
-                .unwrap_or(template.client_secret.clone()),
+            email: acc.email.clone(),
+            refresh_token: acc.refresh_token.clone().unwrap_or_default(),
+            client_id: pinned(&acc.client_id).unwrap_or(template.client_id.clone()),
+            client_secret: pinned(&acc.client_secret).unwrap_or(template.client_secret.clone()),
         });
     }
-    Ok(out)
+    out
 }
 
 /// A fresh access token from the refresh grant. Tokens last an hour and a

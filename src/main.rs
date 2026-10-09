@@ -24,10 +24,18 @@
 //! `account-color "me@gmail.com" "#6ad08c"` pins an account's dot (a bare
 //! email, or `"google:me@gmail.com"` to tell one address's two accounts
 //! apart), otherwise accounts take a fixed palette in turn.
+//!
+//! The header's Accounts menu shows or hides each synced account's events
+//! (`hide-account "<kind>:<email>"` in the config — display only: they stay
+//! in events.json and keep syncing) and picks the account typed events go
+//! to (it rewrites `push-to`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cce_calendar::{load_records, save_records, EventRecord};
+use cce_calendar::{
+    calendar_accounts, edit_config, load_records, push_target_config, save_push_target, save_records,
+    CalendarAccount, EventRecord, PushTarget,
+};
 use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
 
 use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
@@ -46,7 +54,13 @@ use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{AlignH, AlignV, ControlPlate, DisplayList, PaintCtx, PlateStance, TextAttrs, TextLayout};
 use cce_ui::scene::Material;
 use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, ScrollPhase};
-use cce_ui::widget::{Button, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Paint};
+use cce_ui::context::UiContext;
+use cce_ui::widget::context_menu::{self, MARK_CHECK, MARK_OFF, MARK_ON};
+use cce_ui::widget::Event as WidgetEvent;
+use cce_ui::widget::{
+    Adapted, Button, Dropdown, ElementState, Handle, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Paint,
+    WidgetHost,
+};
 
 /// How often events.json is re-stat'd. The runner wakes an idle app once a
 /// second anyway; `idle_poll_interval` pins that rather than inheriting it.
@@ -100,6 +114,11 @@ enum HeaderBtn {
 const TODAY_BTN_W: f32 = 64.0;
 /// The month title's width between the two arrows.
 const TITLE_W: f32 = 190.0;
+/// The Accounts menu button's width, left of "Today".
+const ACCOUNTS_W: f32 = 104.0;
+/// The Accounts menu's `selected` between picks: no row, so every pick —
+/// the same row twice included — reads as a change.
+const NO_ROW: usize = 999;
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -242,6 +261,40 @@ fn source_colors(
         .collect()
 }
 
+/// `hide-account "<kind>:<email>"` nodes: accounts whose events the app
+/// does not draw.
+fn hidden_accounts_config() -> BTreeSet<String> {
+    let Some(doc) = std::fs::read_to_string(cce_calendar::config_path())
+        .ok()
+        .and_then(|t| t.parse::<kdl::KdlDocument>().ok())
+    else {
+        return BTreeSet::new();
+    };
+    doc.nodes()
+        .iter()
+        .filter(|n| n.name().value() == "hide-account")
+        .filter_map(|n| n.entries().iter().find(|e| e.name().is_none())?.value().as_string())
+        .map(String::from)
+        .collect()
+}
+
+fn save_hidden_accounts(hidden: &BTreeSet<String>) -> std::io::Result<()> {
+    edit_config(|doc| {
+        let nodes = doc.nodes_mut();
+        nodes.retain(|n| n.name().value() != "hide-account");
+        for source in hidden {
+            let mut node = kdl::KdlNode::new("hide-account");
+            node.push(kdl::KdlEntry::new(source.clone()));
+            nodes.push(node);
+        }
+    })
+}
+
+fn account_label(a: &CalendarAccount) -> String {
+    let kind = if a.kind == "icloud" { "iCloud" } else { "Google" };
+    format!("{kind} · {}", a.email)
+}
+
 fn add_months(year: i32, month: u32, delta: i32) -> (i32, u32) {
     let idx = year * 12 + month as i32 - 1 + delta;
     (idx.div_euclid(12), (idx.rem_euclid(12) + 1) as u32)
@@ -271,6 +324,9 @@ struct Geom {
     prev_btn: Rect,
     next_btn: Rect,
     today_btn: Rect,
+    /// The Accounts menu trigger; `None` when the header is too narrow to
+    /// fit it beside the month title.
+    accounts_btn: Option<Rect>,
     /// The month grid's frame, outer edge of the outer lines.
     grid: Rect,
     /// The pitch: one line centre to the next.
@@ -327,6 +383,16 @@ struct CalendarApp {
     account_colors: Vec<(String, [f32; 4])>,
     /// Each synced account's dot, rebuilt whenever `events` is.
     source_colors: BTreeMap<String, [f32; 4]>,
+    /// The accounts the sync mirrors (accounts.json), for the Accounts menu.
+    accounts: Vec<CalendarAccount>,
+    /// Sources (`kind:email`) whose events are not drawn. They stay in
+    /// `events` and in the file: a save that dropped them would read to the
+    /// sync as deletions, and it would delete them upstream.
+    hidden: BTreeSet<String>,
+    /// `push-to` as configured; `None` leaves the choice to the sync.
+    push: Option<PushTarget>,
+    ui_context: UiContext,
+    accounts_menu: Handle<Adapted<Dropdown>>,
     /// Displayed (year, month).
     view: (i32, u32),
     selected: NaiveDate,
@@ -421,11 +487,19 @@ impl CalendarApp {
         let first_day = first_of_month
             .checked_sub_days(Days::new(back as u64))
             .unwrap_or(first_of_month);
+        let today_btn = btn(header.x + header.width - TODAY_BTN_W, TODAY_BTN_W);
+        let next_btn = btn(header.x + btn_h + TITLE_W, btn_h);
+        let accounts_x = today_btn.x - plate_gap() - ACCOUNTS_W;
+        let accounts_btn = (accounts_x >= next_btn.x + next_btn.width + plate_gap()).then(|| {
+            let h = cce_ui::layout::dropdown_height().min(HEADER_H);
+            Rect { x: accounts_x, y: header.y + (HEADER_H - h) / 2.0, width: ACCOUNTS_W, height: h }
+        });
         Geom {
             header,
             prev_btn: btn(header.x, btn_h),
-            next_btn: btn(header.x + btn_h + TITLE_W, btn_h),
-            today_btn: btn(header.x + header.width - TODAY_BTN_W, TODAY_BTN_W),
+            next_btn,
+            today_btn,
+            accounts_btn,
             grid,
             cell_w,
             cell_h,
@@ -459,7 +533,7 @@ impl CalendarApp {
         if !g.list.contains(x, y) {
             return None;
         }
-        let events = self.events.get(&self.selected).map_or(0, Vec::len);
+        let events = self.shown(self.selected).len();
         (0..events).find(|&i| self.sidebar_row(g, i).contains(x, y))
     }
 
@@ -484,7 +558,7 @@ impl CalendarApp {
 
     /// How far the selected day's event rows overflow the sidebar's list area.
     fn sidebar_overflow(&self, g: &Geom) -> f32 {
-        let events = self.events.get(&self.selected).map_or(0, Vec::len);
+        let events = self.shown(self.selected).len();
         (events as f32 * ROW_H - g.list.height).max(0.0)
     }
 
@@ -523,6 +597,103 @@ impl CalendarApp {
         }
     }
 
+    /// The day's events that are drawn — all but hidden accounts' — each
+    /// with its index in `events[date]`. `sel_event`, `hover_row` and the
+    /// sidebar rows index this list, not the day's full one.
+    fn shown(&self, date: NaiveDate) -> Vec<(usize, &Event)> {
+        self.events.get(&date).map_or_else(Vec::new, |day| {
+            day.iter()
+                .enumerate()
+                .filter(|(_, e)| e.source.as_ref().is_none_or(|s| !self.hidden.contains(s)))
+                .collect()
+        })
+    }
+
+    /// The account typed events go to, as the sync resolves `push-to`:
+    /// the named account, else the first of the configured kind (iCloud
+    /// when unconfigured and there is one). `None` keeps them local.
+    fn default_account(&self) -> Option<usize> {
+        let (kind, email) = match &self.push {
+            Some(p) => (p.kind.as_str(), p.account.as_deref()),
+            None if self.accounts.iter().any(|a| a.kind == "icloud") => ("icloud", None),
+            None => ("google", None),
+        };
+        self.accounts
+            .iter()
+            .position(|a| a.kind == kind && email.is_none_or(|e| e.eq_ignore_ascii_case(&a.email)))
+    }
+
+    /// The Accounts menu's rows, dispatched by index in
+    /// `accounts_menu_pick`: a show/hide switch per account, a separator,
+    /// then the radio group for where typed events go.
+    fn accounts_options(&self) -> Vec<String> {
+        let mut rows: Vec<String> = self
+            .accounts
+            .iter()
+            .map(|a| {
+                let mark = if self.hidden.contains(&a.source()) { "" } else { MARK_CHECK };
+                format!("{mark}Show {}", account_label(a))
+            })
+            .collect();
+        rows.push("-".to_string());
+        let default = self.default_account();
+        let radio = |on: bool| if on { MARK_ON } else { MARK_OFF };
+        for (i, a) in self.accounts.iter().enumerate() {
+            rows.push(format!("{}New events → {}", radio(default == Some(i)), account_label(a)));
+        }
+        rows.push(format!("{}New events → this computer only", radio(default.is_none())));
+        rows
+    }
+
+    fn accounts_menu_pick(&mut self, row: usize) {
+        let n = self.accounts.len();
+        if let Some(a) = self.accounts.get(row) {
+            let source = a.source();
+            if !self.hidden.remove(&source) {
+                self.hidden.insert(source);
+            }
+            self.sel_event = None;
+            self.hover_row = None;
+            self.sidebar_scroll = 0.0;
+            self.status = save_hidden_accounts(&self.hidden).err().map(|e| format!("saving config failed: {e}"));
+        } else if (n + 1..=2 * n + 1).contains(&row) {
+            let pick = row - n - 1;
+            let mut target = match self.accounts.get(pick) {
+                Some(a) => PushTarget { kind: a.kind.to_string(), account: Some(a.email.clone()), calendar: None },
+                None => PushTarget { kind: "none".to_string(), account: None, calendar: None },
+            };
+            // A named calendar belongs to the account it was set for; keep
+            // it only when the pick resolves to that same account.
+            if self.default_account() == self.accounts.get(pick).map(|_| pick) {
+                target.calendar = self.push.as_ref().and_then(|p| p.calendar.clone());
+            }
+            self.status = save_push_target(&target).err().map(|e| format!("saving config failed: {e}"));
+            self.push = Some(target);
+        }
+        self.refresh_accounts_menu();
+    }
+
+    fn refresh_accounts_menu(&mut self) {
+        let options = self.accounts_options();
+        let menu = &mut self.ui_context[self.accounts_menu];
+        menu.options = options;
+        menu.selected = NO_ROW;
+    }
+
+    /// After the Accounts menu took an event: act on a pick, and give the
+    /// keyboard back to the calendar once the menu is closed — by a pick,
+    /// Escape or a click — so Enter and the arrows are the calendar's again
+    /// rather than reopening the menu.
+    fn drain_accounts_menu(&mut self) {
+        if self.ui_context[self.accounts_menu].take_change() {
+            let row = self.ui_context[self.accounts_menu].selected;
+            self.accounts_menu_pick(row);
+        }
+        if !self.ui_context[self.accounts_menu].is_expanded() {
+            self.ui_context.unfocus_id(self.accounts_menu.id());
+        }
+    }
+
     fn save(&mut self) {
         let records: Vec<EventRecord> = self
             .events
@@ -549,7 +720,7 @@ impl CalendarApp {
         self.events = load_events();
         self.source_colors = source_colors(&self.events, &self.account_colors);
         self.file_mtime = file_mtime();
-        let n = self.events.get(&self.selected).map_or(0, Vec::len);
+        let n = self.shown(self.selected).len();
         if self.sel_event.is_some_and(|i| i >= n) {
             self.sel_event = None;
         }
@@ -568,14 +739,17 @@ impl CalendarApp {
     }
 
     fn delete_selected_event(&mut self) {
-        let Some(idx) = self.sel_event.take() else {
+        let Some(shown) = self.sel_event.take() else {
+            return;
+        };
+        let Some(idx) = self.shown(self.selected).get(shown).map(|(i, _)| *i) else {
             return;
         };
         if let Some(day) = self.events.get_mut(&self.selected) {
             if day.get(idx).is_some_and(|e| e.recurring) {
                 // One instance of a repeating event: the server has no
                 // "just this one" the mirror could express, so it stays.
-                self.sel_event = Some(idx);
+                self.sel_event = Some(shown);
                 self.status = Some("repeating event — change it on the phone".to_string());
                 return;
             }
@@ -744,13 +918,14 @@ impl CalendarApp {
                 TextAttrs { italic: false, weight: Some(600), ..Default::default() }, Self::boxed(num, AlignH::Center));
 
             // Event chips: dot + clipped title, then a "+N" overflow line.
-            if let Some(events) = self.events.get(&date) {
+            let events = self.shown(date);
+            if !events.is_empty() {
                 let line_h = 15.0;
                 let avail = ((cell.height - 26.0) / line_h).max(0.0) as usize;
                 let shown = if avail >= events.len() { events.len() } else { avail.saturating_sub(1) };
                 pc.clip(cell, |pc| {
                     let mut y = cell.y + 24.0;
-                    for e in events.iter().take(shown) {
+                    for (_, e) in events.iter().take(shown) {
                         let dot = match &e.source {
                             Some(s) => self.source_colors.get(s).copied().unwrap_or(ACCOUNT_DOTS[0]),
                             None => EVENT_DOT,
@@ -818,7 +993,7 @@ impl CalendarApp {
             pc.text("today", g.sidebar.x + pad, head_y + 20.0, 10.5, TEXT_FAINT);
         }
 
-        let events = self.events.get(&self.selected).map(Vec::as_slice).unwrap_or(&[]);
+        let events = self.shown(self.selected);
         // style: deliberate — the text offsets inside a row and inside the
         // strip (+8/+9/+12, the -4/-8 clip margins, the time column's 12px
         // gutter) are a control's own text insets, not ladder spacings.
@@ -838,7 +1013,7 @@ impl CalendarApp {
                 pc.text_with("No events", g.sidebar.x + pad, g.list.y + 9.0, size, TEXT_FAINT,
                     Some(font.clone()), None);
             }
-            for (i, e) in events.iter().enumerate() {
+            for (i, (_, e)) in events.iter().enumerate() {
                 let row = self.sidebar_row(g, i);
                 let wash = self.row_wash(i);
                 if wash[3] > 0.0 {
@@ -973,14 +1148,33 @@ impl CalendarApp {
 impl Application for CalendarApp {
     type Message = Message;
 
+    fn ui_context(&self) -> Option<&UiContext> {
+        Some(&self.ui_context)
+    }
+
+    fn ui_context_mut(&mut self) -> Option<&mut UiContext> {
+        Some(&mut self.ui_context)
+    }
+
     fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
         let today = Local::now().date_naive();
         let events = load_events();
         let account_colors = account_colors_config();
-        Self {
+        let accounts = calendar_accounts().unwrap_or_else(|e| {
+            log::warn!("no accounts for the Accounts menu: {e}");
+            Vec::new()
+        });
+        let mut ui_context = UiContext::new();
+        let accounts_menu = ui_context.insert(Dropdown::new(Vec::new(), NO_ROW).with_custom_display_text("Accounts"));
+        let mut app = Self {
             source_colors: source_colors(&events, &account_colors),
             events,
             account_colors,
+            accounts,
+            hidden: hidden_accounts_config(),
+            push: push_target_config(),
+            ui_context,
+            accounts_menu,
             view: (today.year(), today.month()),
             selected: today,
             sel_event: None,
@@ -997,7 +1191,9 @@ impl Application for CalendarApp {
             hover_row: None,
             file_mtime: file_mtime(),
             watch_at: std::time::Instant::now(),
-        }
+        };
+        app.refresh_accounts_menu();
+        app
     }
 
     fn settings(&self) -> WindowSettings {
@@ -1050,6 +1246,26 @@ impl Application for CalendarApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        let (px, py) = (pos.x, pos.y);
+        // The shared context menu (a right-click on the Accounts menu opens
+        // one) has the pointer to itself while open: its row highlight.
+        if context_menu::is_visible() {
+            if context_menu::cursor_moved(px, py) {
+                *needs_rebuild = true;
+            }
+            return;
+        }
+        let ev = WidgetEvent::PointerMove { x: px, y: py, local_x: px, local_y: py };
+        if self.ui_context.propagate_event(&ev, self.accounts_menu.id()) {
+            *needs_rebuild = true;
+        }
+        if self.ui_context[self.accounts_menu].is_expanded() {
+            // The open menu covers the grid: no hover underneath it.
+            if self.hover_btn.take().is_some() | self.hover_row.take().is_some() {
+                *needs_rebuild = true;
+            }
+            return;
+        }
         let g = self.geom();
         let hover = Self::header_btn_at(&g, pos.x, pos.y);
         let row = self.row_at(&g, pos.x, pos.y);
@@ -1067,6 +1283,25 @@ impl Application for CalendarApp {
         pos: LogicalPosition,
         needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
+        let (px, py) = (pos.x, pos.y);
+        // The context menu takes every click while open: a row runs, a press
+        // elsewhere dismisses it. The toolkit leaves this routing to the app.
+        if context_menu::is_visible() {
+            if context_menu::mouse_input(button, state, px, py, Some(&mut self.ui_context)) {
+                *needs_rebuild = true;
+            }
+            return None;
+        }
+        // The Accounts menu first: its open list lies over the grid.
+        let ev = WidgetEvent::MouseButton { button, state, x: px, y: py, local_x: px, local_y: py };
+        if self.ui_context.propagate_event(&ev, self.accounts_menu.id()) {
+            self.drain_accounts_menu();
+            *needs_rebuild = true;
+            return None;
+        }
+        if state == ElementState::Pressed {
+            self.ui_context.unfocus_id(self.accounts_menu.id());
+        }
         if button != MouseButton::Left {
             return None;
         }
@@ -1151,6 +1386,19 @@ impl Application for CalendarApp {
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        // The Accounts menu takes keys while open, or while Tab has focused
+        // it (Enter / Space opens it) and nothing is being typed; otherwise
+        // they are the calendar's.
+        let menu = self.accounts_menu.id();
+        let focused = self.ui_context.is_focused_id(menu) && self.input.is_none();
+        if self.ui_context[self.accounts_menu].is_expanded() || focused {
+            let ev = WidgetEvent::KeyInput(event.clone());
+            if self.ui_context.propagate_event(&ev, menu) {
+                self.drain_accounts_menu();
+                *needs_rebuild = true;
+                return None;
+            }
+        }
         if event.state != ElementState::Pressed {
             return None;
         }
@@ -1168,12 +1416,31 @@ impl Application for CalendarApp {
     fn display_list(&mut self, size: LogicalSize, _scale: f64) -> Option<DisplayList> {
         self.win = (size.width, size.height);
         let g = self.geom();
+        // No accounts, or no room beside the title: no menu (a zero rect
+        // also takes it out of hit-testing).
+        let menu_rect = g.accounts_btn.filter(|_| !self.accounts.is_empty());
+        let r = menu_rect.unwrap_or(Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
+        self.ui_context[self.accounts_menu].set_rect(r.x, r.y, r.width, r.height);
+        self.ui_context.rebuild_spatial_grid();
+        // Registration feeds the engine's text-occlusion clamp and its
+        // close-on-outside-press; the list itself is painted last, below.
+        self.ui_context.clear_popovers();
+        let open = self.ui_context[self.accounts_menu].popover_rect().is_some();
+        if open {
+            self.ui_context.register_popover_id(self.accounts_menu.id());
+        }
         let mut pc = PaintCtx::new();
         // The standard root plate (cce-ui PlateSpec::window).
         pc.root_plate(size.width, size.height);
         self.paint_header(&mut pc, &g);
+        if menu_rect.is_some() {
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.accounts_menu], &mut pc);
+        }
         self.paint_grid(&mut pc, &g);
         self.paint_sidebar(&mut pc, &g);
+        if open {
+            self.ui_context[self.accounts_menu].render_popover(&mut pc);
+        }
         Some(pc.finish())
     }
 

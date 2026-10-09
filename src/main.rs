@@ -29,8 +29,17 @@
 //! (`hide-account "<kind>:<email>"` in the config — display only: they stay
 //! in events.json and keep syncing) and picks the account typed events go
 //! to (it rewrites `push-to`).
+//!
+//! Dated tasks from the notes vault (any `- [ ] … 📅 2026-10-20` checkbox,
+//! or `due 2026-10-20`, in any note — cce-list's lists included) show on
+//! their day as a ring, and in the day pane as checkbox rows below the
+//! events; a click ticks or unticks one in its note. They are read from
+//! the vault and never enter events.json, where the sync would push them
+//! to a calendar as events.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use cce_calendar::{
     calendar_accounts, edit_config, load_records, push_target_config, save_push_target, save_records,
@@ -58,7 +67,7 @@ use cce_ui::context::UiContext;
 use cce_ui::widget::context_menu::{self, MARK_CHECK, MARK_OFF, MARK_ON};
 use cce_ui::widget::Event as WidgetEvent;
 use cce_ui::widget::{
-    Adapted, Button, Dropdown, ElementState, Handle, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Paint,
+    Adapted, Button, Checkbox, Dropdown, ElementState, Handle, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Paint,
     WidgetHost,
 };
 
@@ -97,6 +106,9 @@ const ACCOUNT_DOTS: [[f32; 4]; 6] = [
     [0.35, 0.80, 0.80, 1.0], // teal
     [0.95, 0.50, 0.42, 1.0], // coral
 ];
+/// The ring a vault task wears in the grid (an event wears a dot).
+const TASK_RING: [f32; 4] = [0.85, 0.86, 0.90, 1.0];
+const TASK_RING_DONE: [f32; 4] = [0.45, 0.47, 0.52, 1.0];
 const TEXT: [u8; 3] = [225, 228, 232];
 const TEXT_DIM: [u8; 3] = [140, 145, 152];
 const TEXT_FAINT: [u8; 3] = [95, 100, 108];
@@ -163,6 +175,79 @@ fn load_events() -> BTreeMap<NaiveDate, Vec<Event>> {
         sort_events(events);
     }
     map
+}
+
+/// A dated checkbox from the notes vault, on its due day. `text` is
+/// without the date.
+#[derive(Clone, Debug)]
+struct DayTask {
+    path: String,
+    line: usize,
+    text: String,
+    done: bool,
+}
+
+/// The vault's dated tasks: cce-vault's index of the notes vault (the one
+/// cce-notes and cce-list use), kept current by its watcher. The watcher
+/// queues changed paths on its own thread; `poll` applies them on the
+/// app's tick.
+struct VaultTasks {
+    index: cce_vault::Index,
+    _watcher: Option<cce_vault::VaultWatcher>,
+    pending: Arc<Mutex<Vec<PathBuf>>>,
+    by_day: BTreeMap<NaiveDate, Vec<DayTask>>,
+}
+
+impl VaultTasks {
+    /// `None` when no vault is configured or it cannot be read.
+    fn open() -> Option<VaultTasks> {
+        let root = cce_vault::config::vault_root(None).ok()?;
+        let index = cce_vault::Index::open(&root, true).map_err(|e| log::warn!("vault tasks: {e}")).ok()?;
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let queue = pending.clone();
+        let watcher = cce_vault::VaultWatcher::spawn(&root, move |paths| {
+            queue.lock().unwrap_or_else(|e| e.into_inner()).extend(paths);
+        })
+        .map_err(|e| log::warn!("vault watcher: {e}"))
+        .ok();
+        let mut v = VaultTasks { index, _watcher: watcher, pending, by_day: BTreeMap::new() };
+        v.rebuild();
+        Some(v)
+    }
+
+    fn rebuild(&mut self) {
+        let mut by_day: BTreeMap<NaiveDate, Vec<DayTask>> = BTreeMap::new();
+        for (path, t) in self.index.tasks() {
+            if let Some(due) = t.due {
+                by_day.entry(due).or_default().push(DayTask {
+                    path: path.to_string(),
+                    line: t.line,
+                    text: cce_vault::split_due(&t.text).0,
+                    done: !t.is_open(),
+                });
+            }
+        }
+        self.by_day = by_day;
+    }
+
+    /// Apply queued vault changes; true when the tasks may have changed.
+    fn poll(&mut self) -> bool {
+        let paths: Vec<PathBuf> = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
+        if paths.is_empty() {
+            return false;
+        }
+        self.index.apply_changes(&paths);
+        self.rebuild();
+        true
+    }
+
+    /// Tick or untick a task in its note. cce-vault re-reads the note
+    /// first, so an edit made elsewhere a moment ago is not overwritten.
+    fn set_done(&mut self, path: &str, line: usize, done: bool) -> Result<(), String> {
+        self.index.set_task(path, line, if done { 'x' } else { ' ' }).map_err(|e| e.to_string())?;
+        self.rebuild();
+        Ok(())
+    }
 }
 
 fn sort_events(events: &mut [Event]) {
@@ -393,6 +478,8 @@ struct CalendarApp {
     push: Option<PushTarget>,
     ui_context: UiContext,
     accounts_menu: Handle<Adapted<Dropdown>>,
+    /// Dated tasks from the notes vault; `None` without a vault.
+    vault: Option<VaultTasks>,
     /// Displayed (year, month).
     view: (i32, u32),
     selected: NaiveDate,
@@ -533,8 +620,8 @@ impl CalendarApp {
         if !g.list.contains(x, y) {
             return None;
         }
-        let events = self.shown(self.selected).len();
-        (0..events).find(|&i| self.sidebar_row(g, i).contains(x, y))
+        let rows = self.day_rows(self.selected);
+        (0..rows).find(|&i| self.sidebar_row(g, i).contains(x, y))
     }
 
     /// A row's state wash: the colour cce-ui's list-row Button wears in the
@@ -558,8 +645,8 @@ impl CalendarApp {
 
     /// How far the selected day's event rows overflow the sidebar's list area.
     fn sidebar_overflow(&self, g: &Geom) -> f32 {
-        let events = self.shown(self.selected).len();
-        (events as f32 * ROW_H - g.list.height).max(0.0)
+        let rows = self.day_rows(self.selected);
+        (rows as f32 * ROW_H - g.list.height).max(0.0)
     }
 
     /// Per-frame sidebar glide/coast; true while `sidebar_scroll` is still
@@ -607,6 +694,32 @@ impl CalendarApp {
                 .filter(|(_, e)| e.source.as_ref().is_none_or(|s| !self.hidden.contains(s)))
                 .collect()
         })
+    }
+
+    /// An event's dot: its account's colour, or amber for a local one.
+    fn dot_color(&self, e: &Event) -> [f32; 4] {
+        match &e.source {
+            Some(s) => self.source_colors.get(s).copied().unwrap_or(ACCOUNT_DOTS[0]),
+            None => EVENT_DOT,
+        }
+    }
+
+    /// The day's vault tasks, in note and line order.
+    fn tasks(&self, date: NaiveDate) -> &[DayTask] {
+        self.vault.as_ref().and_then(|v| v.by_day.get(&date)).map_or(&[], Vec::as_slice)
+    }
+
+    /// The day pane's rows: the shown events, then the day's tasks.
+    fn day_rows(&self, date: NaiveDate) -> usize {
+        self.shown(date).len() + self.tasks(date).len()
+    }
+
+    /// Tick or untick the selected day's task `i`.
+    fn toggle_task(&mut self, i: usize) {
+        let Some(t) = self.tasks(self.selected).get(i).cloned() else { return };
+        if let Some(v) = self.vault.as_mut() {
+            self.status = v.set_done(&t.path, t.line, !t.done).err().map(|e| format!("{}: {e}", t.path));
+        }
     }
 
     /// The account typed events go to, as the sync resolves `push-to`:
@@ -917,27 +1030,32 @@ impl CalendarApp {
             pc.text_boxed(date.day().to_string(), num.x, num.y, 11.5, num_color, None, None,
                 TextAttrs { italic: false, weight: Some(600), ..Default::default() }, Self::boxed(num, AlignH::Center));
 
-            // Event chips: dot + clipped title, then a "+N" overflow line.
+            // Chips — events (a dot), then vault tasks (a ring) — each a
+            // marker and a clipped title, then a "+N" overflow line.
             let events = self.shown(date);
-            if !events.is_empty() {
+            let tasks = self.tasks(date);
+            let total = events.len() + tasks.len();
+            if total > 0 {
                 let line_h = 15.0;
                 let avail = ((cell.height - 26.0) / line_h).max(0.0) as usize;
-                let shown = if avail >= events.len() { events.len() } else { avail.saturating_sub(1) };
+                let shown = if avail >= total { total } else { avail.saturating_sub(1) };
+                let clip = Some([cell.x, cell.y, cell.x + cell.width - 4.0, cell.y + cell.height]);
+                let text = if in_month { TEXT } else { TEXT_DIM };
                 pc.clip(cell, |pc| {
                     let mut y = cell.y + 24.0;
                     for (_, e) in events.iter().take(shown) {
-                        let dot = match &e.source {
-                            Some(s) => self.source_colors.get(s).copied().unwrap_or(ACCOUNT_DOTS[0]),
-                            None => EVENT_DOT,
-                        };
-                        pc.circle(cell.x + 9.0, y + 6.0, 2.5, dot);
-                        let alpha = if in_month { TEXT } else { TEXT_DIM };
-                        pc.text_with(e.title.clone(), cell.x + 15.0, y, 10.0, alpha, None,
-                            Some([cell.x, cell.y, cell.x + cell.width - 4.0, cell.y + cell.height]));
+                        pc.circle(cell.x + 9.0, y + 6.0, 2.5, self.dot_color(e));
+                        pc.text_with(e.title.clone(), cell.x + 15.0, y, 10.0, text, None, clip);
                         y += line_h;
                     }
-                    if events.len() > shown {
-                        pc.text_with(format!("+{} more", events.len() - shown), cell.x + 15.0, y,
+                    for t in tasks.iter().take(shown.saturating_sub(events.len())) {
+                        let (ring, color) = if t.done { (TASK_RING_DONE, TEXT_FAINT) } else { (TASK_RING, text) };
+                        pc.arc(cell.x + 9.0, y + 6.0, 2.6, 1.2, 0.0, std::f32::consts::TAU, ring);
+                        pc.text_with(t.text.clone(), cell.x + 15.0, y, 10.0, color, None, clip);
+                        y += line_h;
+                    }
+                    if total > shown {
+                        pc.text_with(format!("+{} more", total - shown), cell.x + 15.0, y,
                             10.0, TEXT_FAINT, None, None);
                     }
                 });
@@ -1008,8 +1126,12 @@ impl CalendarApp {
         let title_color = [(fc[0] * 255.0) as u8, (fc[1] * 255.0) as u8, (fc[2] * 255.0) as u8];
         let time_w = shaped_width("00:00", size, &font);
         let radius = button_corner_radius();
+        let tasks = self.tasks(self.selected);
+        // A leading marker column — an event's account dot, a task's
+        // checkbox — then the time column, then the title.
+        let mark_w = 2.0 * Checkbox::INLINE_HALF + 8.0;
         pc.clip(g.list, |pc| {
-            if events.is_empty() {
+            if events.is_empty() && tasks.is_empty() {
                 pc.text_with("No events", g.sidebar.x + pad, g.list.y + 9.0, size, TEXT_FAINT,
                     Some(font.clone()), None);
             }
@@ -1020,11 +1142,37 @@ impl CalendarApp {
                     pc.rounded_rect(row, radius, (true, true, true, true), wash);
                 }
                 let ty = align_text_y(row.y, row.height, size, 0.0);
+                let mark_cx = row.x + 8.0 + Checkbox::INLINE_HALF;
+                pc.circle(mark_cx, row.y + row.height / 2.0, 3.5, self.dot_color(e));
                 let time = e.time.map_or("——".to_string(), |(h, m)| format!("{h:02}:{m:02}"));
-                pc.text_with(time, row.x + 8.0, ty, size,
+                pc.text_with(time, row.x + 8.0 + mark_w, ty, size,
                     if e.time.is_some() { TEXT_ACCENT } else { TEXT_FAINT }, Some(font.clone()), None);
-                pc.text_with(e.title.clone(), row.x + 8.0 + time_w + 12.0, ty, size, title_color,
+                pc.text_with(e.title.clone(), row.x + 8.0 + mark_w + time_w + 12.0, ty, size, title_color,
                     Some(font.clone()), Some([row.x, row.y, row.x + row.width - 4.0, row.y + row.height]));
+            }
+            for (j, t) in tasks.iter().enumerate() {
+                let i = events.len() + j;
+                let row = self.sidebar_row(g, i);
+                let wash = self.row_wash(i);
+                if wash[3] > 0.0 {
+                    pc.rounded_rect(row, radius, (true, true, true, true), wash);
+                }
+                let ty = align_text_y(row.y, row.height, size, 0.0);
+                let cx = row.x + 8.0 + Checkbox::INLINE_HALF;
+                let cy = row.y + row.height / 2.0;
+                Checkbox::paint_inline(pc, cx, cy, Checkbox::INLINE_HALF, t.done);
+                // A task has no time; its title starts at the time column,
+                // so it reads as a to-do rather than a slot in the day.
+                let tx = row.x + 8.0 + mark_w;
+                let color = if t.done { TEXT_FAINT } else { title_color };
+                pc.text_with(t.text.clone(), tx, ty, size, color, Some(font.clone()),
+                    Some([row.x, row.y, row.x + row.width - 4.0, row.y + row.height]));
+                if t.done {
+                    // Struck through, as cce-list draws a done item.
+                    let w = shaped_width(&t.text, size, &font).min(row.x + row.width - 4.0 - tx);
+                    pc.vector(tx, cy, tx + w, cy, 1.0, [TEXT_FAINT[0] as f32 / 255.0, TEXT_FAINT[1] as f32 / 255.0,
+                        TEXT_FAINT[2] as f32 / 255.0, 1.0], cce_ui::scene::paint::Cap::Flat);
+                }
             }
         });
 
@@ -1175,6 +1323,7 @@ impl Application for CalendarApp {
             push: push_target_config(),
             ui_context,
             accounts_menu,
+            vault: VaultTasks::open(),
             view: (today.year(), today.month()),
             selected: today,
             sel_event: None,
@@ -1236,6 +1385,9 @@ impl Application for CalendarApp {
             self.watch_at = now_i + WATCH_EVERY;
             if self.input.is_none() && file_mtime() != self.file_mtime {
                 self.reload();
+                *needs_rebuild = true;
+            }
+            if self.vault.as_mut().is_some_and(VaultTasks::poll) {
                 *needs_rebuild = true;
             }
         }
@@ -1324,7 +1476,14 @@ impl Application for CalendarApp {
         } else if let Some(date) = self.day_at(&g, x, y) {
             self.select(date);
         } else if g.sidebar.contains(x, y) {
-            self.sel_event = self.row_at(&g, x, y);
+            let events = self.shown(self.selected).len();
+            match self.row_at(&g, x, y) {
+                Some(i) if i >= events => {
+                    self.sel_event = None;
+                    self.toggle_task(i - events);
+                }
+                row => self.sel_event = row,
+            }
         } else {
             return None;
         }

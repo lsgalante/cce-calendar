@@ -5,8 +5,9 @@
 //! `$XDG_DATA_HOME/cce/calendar/events.json` (one flat list of
 //! date/time/title records) and are saved on every mutation. Records with a
 //! `source` are mirrored from a remote calendar by `cce-calendar-sync`
-//! (blue dot). Events typed here are pushed to the default calendar on the
-//! next sync tick and come back carrying their identity; deleting a synced
+//! (a dot coloured per account; local events are amber). Events typed here
+//! are pushed to the default calendar on the next sync tick and come back
+//! carrying their identity; deleting a synced
 //! event here deletes it on the server — except instances of a recurring
 //! event, which are read-only mirrors (the app refuses). The file is
 //! re-read once a second when the sync rewrites it.
@@ -19,9 +20,12 @@
 //! Config (`~/.config/cce/cce-calendar/config.kdl`): `week-start "sunday"`
 //! (default monday); `push-to "icloud"` / `"google"` / `"none"`, optionally
 //! `calendar="Name"`, picks where typed events are created (the sync's
-//! default is iCloud when such an account exists).
+//! default is iCloud when such an account exists);
+//! `account-color "me@gmail.com" "#6ad08c"` pins an account's dot (a bare
+//! email, or `"google:me@gmail.com"` to tell one address's two accounts
+//! apart), otherwise accounts take a fixed palette in turn.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cce_calendar::{load_records, save_records, EventRecord};
 use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
@@ -67,8 +71,18 @@ const GRID_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.06];
 const GRID_LINE_W: f32 = 2.0;
 const ACCENT: [f32; 4] = [0.22, 0.42, 0.85, 1.0];
 const EVENT_DOT: [f32; 4] = [0.95, 0.72, 0.30, 1.0];
-/// Dot for events mirrored from a remote calendar (`source` set).
-const SYNC_DOT: [f32; 4] = [0.42, 0.68, 0.95, 1.0];
+/// Dots for events mirrored from a remote calendar (`source` set), one per
+/// account, dealt out in sorted `source` order and wrapping past the end.
+/// The first is the blue a lone account always had; none is near the
+/// local-event amber.
+const ACCOUNT_DOTS: [[f32; 4]; 6] = [
+    [0.42, 0.68, 0.95, 1.0], // blue
+    [0.45, 0.82, 0.55, 1.0], // green
+    [0.90, 0.48, 0.70, 1.0], // pink
+    [0.68, 0.55, 0.95, 1.0], // violet
+    [0.35, 0.80, 0.80, 1.0], // teal
+    [0.95, 0.50, 0.42, 1.0], // coral
+];
 const TEXT: [u8; 3] = [225, 228, 232];
 const TEXT_DIM: [u8; 3] = [140, 145, 152];
 const TEXT_FAINT: [u8; 3] = [95, 100, 108];
@@ -180,6 +194,54 @@ fn week_start_config() -> Weekday {
     Weekday::Mon
 }
 
+/// `account-color "<key>" "#rrggbb"` nodes from the app config. The key is
+/// a full source (`"google:me@gmail.com"`) or a bare email, which then
+/// covers that address's iCloud and Google accounts alike.
+fn account_colors_config() -> Vec<(String, [f32; 4])> {
+    let path = cce_ui::config::get_app_config_path("cce-calendar");
+    let Some(doc) = std::fs::read_to_string(path).ok().and_then(|t| t.parse::<kdl::KdlDocument>().ok())
+    else {
+        return Vec::new();
+    };
+    doc.nodes()
+        .iter()
+        .filter(|n| n.name().value() == "account-color")
+        .filter_map(|n| {
+            let mut args = n.entries().iter().filter(|e| e.name().is_none()).filter_map(|e| e.value().as_string());
+            let key = args.next()?;
+            let Some(color) = args.next().and_then(cce_ui::color::parse_hex_rgba) else {
+                log::warn!("account-color {key:?}: expected a \"#rrggbb\" colour");
+                return None;
+            };
+            Some((key.to_string(), color))
+        })
+        .collect()
+}
+
+/// The dot colour of every account that has events on file. A configured
+/// colour wins (an exact source over a bare email); the rest take
+/// `ACCOUNT_DOTS` in turn, so accounts stay distinct until the palette runs
+/// out and keep their colours while the set of accounts does not change.
+fn source_colors(
+    events: &BTreeMap<NaiveDate, Vec<Event>>,
+    configured: &[(String, [f32; 4])],
+) -> BTreeMap<String, [f32; 4]> {
+    let sources: BTreeSet<&str> = events.values().flatten().filter_map(|e| e.source.as_deref()).collect();
+    let mut next = 0;
+    sources
+        .into_iter()
+        .map(|source| {
+            let email = source.split_once(':').map_or(source, |(_, e)| e);
+            let find = |key: &str| configured.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, c)| *c);
+            let color = find(source).or_else(|| find(email)).unwrap_or_else(|| {
+                next += 1;
+                ACCOUNT_DOTS[(next - 1) % ACCOUNT_DOTS.len()]
+            });
+            (source.to_string(), color)
+        })
+        .collect()
+}
+
 fn add_months(year: i32, month: u32, delta: i32) -> (i32, u32) {
     let idx = year * 12 + month as i32 - 1 + delta;
     (idx.div_euclid(12), (idx.rem_euclid(12) + 1) as u32)
@@ -261,6 +323,10 @@ fn shaped_width(text: &str, size: f32, font: &str) -> f32 {
 
 struct CalendarApp {
     events: BTreeMap<NaiveDate, Vec<Event>>,
+    /// `account-color` overrides from the config, read once at start.
+    account_colors: Vec<(String, [f32; 4])>,
+    /// Each synced account's dot, rebuilt whenever `events` is.
+    source_colors: BTreeMap<String, [f32; 4]>,
     /// Displayed (year, month).
     view: (i32, u32),
     selected: NaiveDate,
@@ -481,6 +547,7 @@ impl CalendarApp {
     /// selection where it still makes sense.
     fn reload(&mut self) {
         self.events = load_events();
+        self.source_colors = source_colors(&self.events, &self.account_colors);
         self.file_mtime = file_mtime();
         let n = self.events.get(&self.selected).map_or(0, Vec::len);
         if self.sel_event.is_some_and(|i| i >= n) {
@@ -684,7 +751,10 @@ impl CalendarApp {
                 pc.clip(cell, |pc| {
                     let mut y = cell.y + 24.0;
                     for e in events.iter().take(shown) {
-                        let dot = if e.source.is_some() { SYNC_DOT } else { EVENT_DOT };
+                        let dot = match &e.source {
+                            Some(s) => self.source_colors.get(s).copied().unwrap_or(ACCOUNT_DOTS[0]),
+                            None => EVENT_DOT,
+                        };
                         pc.circle(cell.x + 9.0, y + 6.0, 2.5, dot);
                         let alpha = if in_month { TEXT } else { TEXT_DIM };
                         pc.text_with(e.title.clone(), cell.x + 15.0, y, 10.0, alpha, None,
@@ -905,8 +975,12 @@ impl Application for CalendarApp {
 
     fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
         let today = Local::now().date_naive();
+        let events = load_events();
+        let account_colors = account_colors_config();
         Self {
-            events: load_events(),
+            source_colors: source_colors(&events, &account_colors),
+            events,
+            account_colors,
             view: (today.year(), today.month()),
             selected: today,
             sel_event: None,
@@ -1115,4 +1189,37 @@ impl Application for CalendarApp {
 fn main() {
     env_logger::init();
     cce_ui::engine::run::<CalendarApp>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synced(source: &str) -> Event {
+        Event { time: None, title: "x".into(), uid: None, source: Some(source.into()), recurring: false }
+    }
+
+    #[test]
+    fn accounts_get_distinct_dots_and_config_wins() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let mut events = BTreeMap::new();
+        events.insert(day, vec![
+            synced("icloud:a@me.com"),
+            synced("google:b@gmail.com"),
+            synced("google:c@gmail.com"),
+            parse_event("local").unwrap(),
+        ]);
+        let colors = source_colors(&events, &[]);
+        assert_eq!(colors.len(), 3);
+        // Sorted by source: google:b, google:c, icloud:a.
+        assert_eq!(colors["google:b@gmail.com"], ACCOUNT_DOTS[0]);
+        assert_eq!(colors["google:c@gmail.com"], ACCOUNT_DOTS[1]);
+        assert_eq!(colors["icloud:a@me.com"], ACCOUNT_DOTS[2]);
+
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let colors = source_colors(&events, &[("B@gmail.com".into(), red)]);
+        assert_eq!(colors["google:b@gmail.com"], red);
+        // A pinned account does not use up a palette slot.
+        assert_eq!(colors["google:c@gmail.com"], ACCOUNT_DOTS[0]);
+    }
 }

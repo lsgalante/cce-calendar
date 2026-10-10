@@ -56,7 +56,7 @@ use cce_calendar::{
 use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
 
 use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
-use cce_ui::colors::{
+use cce_ui::color::{
     button_background_color, button_hover_color, button_press_color, control_label_color_u8,
     highlight_primary_color, list_font_color, textbox_background_color, textbox_placeholder_text_color,
     well_frame_color,
@@ -1354,7 +1354,7 @@ impl CalendarApp {
                 let slot = Self::date_slot(row);
                 let s = 13.0;
                 let at = Rect { x: slot.x + (slot.width - s) / 2.0, y: slot.y + (slot.height - s) / 2.0, width: s, height: s };
-                pc.icon("calendar", at, cce_ui::colors::to_srgb(cce_ui::colors::TEXT_DIM));
+                pc.icon("calendar", at, cce_ui::color::to_srgb(cce_ui::color::TEXT_DIM));
             }
         };
         pc.clip(g.list, |pc| {
@@ -1522,12 +1522,12 @@ impl CalendarApp {
             for (key, cap_w) in keys.iter().zip(&caps) {
                 let cap = Rect { x, y: cap_y, width: *cap_w, height: cap_h };
                 pc.control_plate(&ControlPlate::control(cap, radius, PlateStance::Raised, None));
-                pc.text_boxed(*key, cap.x, cap.y, size, to_u8(cce_ui::colors::TEXT_FG), Some(font.clone()), None,
+                pc.text_boxed(*key, cap.x, cap.y, size, to_u8(cce_ui::color::TEXT_FG), Some(font.clone()), None,
                     TextAttrs::default(), Self::boxed(cap, AlignH::Center));
                 x += cap_w + 3.0;
             }
             x += 3.0;
-            pc.text_with(*action, x, text_y, size, to_u8(cce_ui::colors::TEXT_DIM), Some(font.clone()), None);
+            pc.text_with(*action, x, text_y, size, to_u8(cce_ui::color::TEXT_DIM), Some(font.clone()), None);
             x += action_w + 14.0;
         }
     }

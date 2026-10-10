@@ -36,6 +36,11 @@
 //! events; a click ticks or unticks one in its note. They are read from
 //! the vault and never enter events.json, where the sync would push them
 //! to a calendar as events.
+//!
+//! Hovering a day-pane row shows a calendar glyph at its right end; it opens
+//! a date picker that moves the row to another day — a task's date in its
+//! note, an event's in events.json (which the sync then moves upstream). A
+//! repeating event's instance cannot be moved, as it cannot be deleted.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -66,6 +71,7 @@ use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, 
 use cce_ui::context::UiContext;
 use cce_ui::widget::context_menu::{self, MARK_CHECK, MARK_OFF, MARK_ON};
 use cce_ui::widget::Event as WidgetEvent;
+use cce_ui::widget::input::date_picker::{DatePicker, Outcome as PickOutcome};
 use cce_ui::widget::{
     Adapted, Button, Checkbox, Dropdown, ElementState, Handle, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Paint,
     WidgetHost,
@@ -131,6 +137,17 @@ const ACCOUNTS_W: f32 = 104.0;
 /// The Accounts menu's `selected` between picks: no row, so every pick —
 /// the same row twice included — reads as a change.
 const NO_ROW: usize = 999;
+/// The calendar glyph's slot at a day-pane row's right end.
+const CAL_S: f32 = 18.0;
+
+/// What an open date picker moves.
+#[derive(Clone, Debug)]
+enum PickTarget {
+    /// The event at `idx` in `events[day]`.
+    Event { day: NaiveDate, idx: usize },
+    /// The vault task on `line` of `path`.
+    Task { path: String, line: usize },
+}
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -243,6 +260,13 @@ impl VaultTasks {
 
     /// Tick or untick a task in its note. cce-vault re-reads the note
     /// first, so an edit made elsewhere a moment ago is not overwritten.
+    /// Set or clear a task's due date in its note (cce-vault re-reads it).
+    fn set_due(&mut self, path: &str, line: usize, due: Option<NaiveDate>) -> Result<(), String> {
+        self.index.set_task_due(path, line, due).map_err(|e| e.to_string())?;
+        self.rebuild();
+        Ok(())
+    }
+
     fn set_done(&mut self, path: &str, line: usize, done: bool) -> Result<(), String> {
         self.index.set_task(path, line, if done { 'x' } else { ' ' }).map_err(|e| e.to_string())?;
         self.rebuild();
@@ -480,6 +504,8 @@ struct CalendarApp {
     accounts_menu: Handle<Adapted<Dropdown>>,
     /// Dated tasks from the notes vault; `None` without a vault.
     vault: Option<VaultTasks>,
+    /// The open date picker, what it moves, and that thing's day-pane row.
+    picker: Option<(DatePicker, PickTarget, usize)>,
     /// Displayed (year, month).
     view: (i32, u32),
     selected: NaiveDate,
@@ -696,6 +722,74 @@ impl CalendarApp {
         })
     }
 
+    /// A day-pane row's calendar-glyph slot, at its right end.
+    fn date_slot(row: Rect) -> Rect {
+        Rect { x: row.x + row.width - 4.0 - CAL_S, y: row.y + (row.height - CAL_S) / 2.0, width: CAL_S, height: CAL_S }
+    }
+
+    /// What day-pane row `i` would move, its title, and whether it can lose
+    /// its date: an event that is not a repeating instance (an event keeps
+    /// a date), or a task (Clear undates it). `None` for anything else.
+    fn row_target(&self, i: usize) -> Option<(PickTarget, String, bool)> {
+        let day = self.selected;
+        let shown = self.shown(day);
+        if let Some((idx, e)) = shown.get(i) {
+            return (!e.recurring).then(|| (PickTarget::Event { day, idx: *idx }, e.title.clone(), false));
+        }
+        let t = self.tasks(day).get(i - shown.len())?;
+        Some((PickTarget::Task { path: t.path.clone(), line: t.line }, t.text.clone(), true))
+    }
+
+    fn open_picker(&mut self, i: usize, g: &Geom) {
+        let Some((target, title, clearable)) = self.row_target(i) else { return };
+        let row = self.sidebar_row(g, i);
+        let picker = DatePicker::open(row, row.x + row.width, Some(self.selected), self.today, self.win)
+            .with_title(title)
+            .with_week_start(self.week_start);
+        self.picker = Some((if clearable { picker } else { picker.without_clear() }, target, i));
+        self.hover_row = None;
+        self.sel_event = None;
+    }
+
+    /// Act on what the picker answered: move its row to the picked day (and
+    /// follow it there), or for a task, Clear its date. True on a change.
+    fn apply_picker(&mut self, outcome: PickOutcome) -> bool {
+        let date = match outcome {
+            PickOutcome::Ignored => return false,
+            PickOutcome::Redraw => return true,
+            PickOutcome::Close => {
+                self.picker = None;
+                return true;
+            }
+            PickOutcome::Set(d) => Some(d),
+            PickOutcome::Clear => None,
+        };
+        let Some((_, target, _)) = self.picker.take() else { return true };
+        match target {
+            PickTarget::Event { day, idx } => {
+                let Some(to) = date.filter(|&d| d != day) else { return true };
+                let Some(list) = self.events.get_mut(&day).filter(|l| idx < l.len()) else { return true };
+                let event = list.remove(idx);
+                if list.is_empty() {
+                    self.events.remove(&day);
+                }
+                let dest = self.events.entry(to).or_default();
+                dest.push(event);
+                sort_events(dest);
+                self.save();
+            }
+            PickTarget::Task { path, line } => {
+                if let Some(v) = self.vault.as_mut() {
+                    self.status = v.set_due(&path, line, date).err().map(|e| format!("{path}: {e}"));
+                }
+            }
+        }
+        if let Some(d) = date {
+            self.select(d);
+        }
+        true
+    }
+
     /// An event's dot: its account's colour, or amber for a local one.
     fn dot_color(&self, e: &Event) -> [f32; 4] {
         match &e.source {
@@ -830,6 +924,8 @@ impl CalendarApp {
     /// Re-read events.json after something else wrote it, keeping the
     /// selection where it still makes sense.
     fn reload(&mut self) {
+        // The rows may have moved under it.
+        self.picker = None;
         self.events = load_events();
         self.source_colors = source_colors(&self.events, &self.account_colors);
         self.file_mtime = file_mtime();
@@ -1105,8 +1201,17 @@ impl CalendarApp {
         );
         let color = if self.selected == self.today { TEXT_ACCENT } else { TEXT };
         let head_y = g.sidebar.y + pad;
-        pc.text(heading, g.sidebar.x + pad, head_y, 14.0, color);
-        if self.selected == self.today {
+        // Display-list text draws above all geometry, so the open picker's
+        // plate cannot hide the text beneath it: what it covers draws none.
+        let cover = self.picker.as_ref().map(|(p, _, _)| p.rect);
+        let covered = |r: Rect| {
+            cover.is_some_and(|c| r.x < c.x + c.width && c.x < r.x + r.width && r.y < c.y + c.height && c.y < r.y + r.height)
+        };
+        let head = Rect { x: g.sidebar.x + pad, y: head_y, width: g.sidebar.width - 2.0 * pad, height: SIDEBAR_HEAD_H };
+        if !covered(head) {
+            pc.text(heading, g.sidebar.x + pad, head_y, 14.0, color);
+        }
+        if self.selected == self.today && !covered(head) {
             // The heading block's second line (a line advance, not a gap).
             pc.text("today", g.sidebar.x + pad, head_y + 20.0, 10.5, TEXT_FAINT);
         }
@@ -1130,6 +1235,17 @@ impl CalendarApp {
         // A leading marker column — an event's account dot, a task's
         // checkbox — then the time column, then the title.
         let mark_w = 2.0 * Checkbox::INLINE_HALF + 8.0;
+        // A row's calendar glyph: on hover, or while its picker is open, and
+        // never on a repeating instance (which cannot move).
+        let glyph = |pc: &mut PaintCtx, row: Rect, i: usize| {
+            let picking = self.picker.as_ref().is_some_and(|(_, _, row)| *row == i);
+            if (self.hover_row == Some(i) || picking) && self.row_target(i).is_some() {
+                let slot = Self::date_slot(row);
+                let s = 13.0;
+                let at = Rect { x: slot.x + (slot.width - s) / 2.0, y: slot.y + (slot.height - s) / 2.0, width: s, height: s };
+                pc.icon("calendar", at, cce_ui::colors::to_srgb(cce_ui::colors::TEXT_DIM));
+            }
+        };
         pc.clip(g.list, |pc| {
             if events.is_empty() && tasks.is_empty() {
                 pc.text_with("No events", g.sidebar.x + pad, g.list.y + 9.0, size, TEXT_FAINT,
@@ -1144,11 +1260,16 @@ impl CalendarApp {
                 let ty = align_text_y(row.y, row.height, size, 0.0);
                 let mark_cx = row.x + 8.0 + Checkbox::INLINE_HALF;
                 pc.circle(mark_cx, row.y + row.height / 2.0, 3.5, self.dot_color(e));
+                if covered(row) {
+                    continue;
+                }
+                glyph(pc, row, i);
+                let clip_r = Self::date_slot(row).x - 4.0;
                 let time = e.time.map_or("——".to_string(), |(h, m)| format!("{h:02}:{m:02}"));
                 pc.text_with(time, row.x + 8.0 + mark_w, ty, size,
                     if e.time.is_some() { TEXT_ACCENT } else { TEXT_FAINT }, Some(font.clone()), None);
                 pc.text_with(e.title.clone(), row.x + 8.0 + mark_w + time_w + 12.0, ty, size, title_color,
-                    Some(font.clone()), Some([row.x, row.y, row.x + row.width - 4.0, row.y + row.height]));
+                    Some(font.clone()), Some([row.x, row.y, clip_r, row.y + row.height]));
             }
             for (j, t) in tasks.iter().enumerate() {
                 let i = events.len() + j;
@@ -1161,15 +1282,20 @@ impl CalendarApp {
                 let cx = row.x + 8.0 + Checkbox::INLINE_HALF;
                 let cy = row.y + row.height / 2.0;
                 Checkbox::paint_inline(pc, cx, cy, Checkbox::INLINE_HALF, t.done);
+                if covered(row) {
+                    continue;
+                }
+                glyph(pc, row, i);
+                let clip_r = Self::date_slot(row).x - 4.0;
                 // A task has no time; its title starts at the time column,
                 // so it reads as a to-do rather than a slot in the day.
                 let tx = row.x + 8.0 + mark_w;
                 let color = if t.done { TEXT_FAINT } else { title_color };
                 pc.text_with(t.text.clone(), tx, ty, size, color, Some(font.clone()),
-                    Some([row.x, row.y, row.x + row.width - 4.0, row.y + row.height]));
+                    Some([row.x, row.y, clip_r, row.y + row.height]));
                 if t.done {
                     // Struck through, as cce-list draws a done item.
-                    let w = shaped_width(&t.text, size, &font).min(row.x + row.width - 4.0 - tx);
+                    let w = shaped_width(&t.text, size, &font).min(clip_r - tx);
                     pc.vector(tx, cy, tx + w, cy, 1.0, [TEXT_FAINT[0] as f32 / 255.0, TEXT_FAINT[1] as f32 / 255.0,
                         TEXT_FAINT[2] as f32 / 255.0, 1.0], cce_ui::scene::paint::Cap::Flat);
                 }
@@ -1178,6 +1304,9 @@ impl CalendarApp {
 
         // Bottom strip: the input field while typing, else the key hints.
         let strip = g.strip;
+        if covered(strip) {
+            return;
+        }
         if let Some(buffer) = &self.input {
             // The field at the toolkit's textbox height, centred in the strip.
             let field_h = textbox_height().min(strip.height);
@@ -1324,6 +1453,7 @@ impl Application for CalendarApp {
             ui_context,
             accounts_menu,
             vault: VaultTasks::open(),
+            picker: None,
             view: (today.year(), today.month()),
             selected: today,
             sel_event: None,
@@ -1388,6 +1518,7 @@ impl Application for CalendarApp {
                 *needs_rebuild = true;
             }
             if self.vault.as_mut().is_some_and(VaultTasks::poll) {
+                self.picker = None;
                 *needs_rebuild = true;
             }
         }
@@ -1403,6 +1534,17 @@ impl Application for CalendarApp {
         // one) has the pointer to itself while open: its row highlight.
         if context_menu::is_visible() {
             if context_menu::cursor_moved(px, py) {
+                *needs_rebuild = true;
+            }
+            return;
+        }
+        if let Some((p, _, _)) = self.picker.as_mut() {
+            // The open picker has the pointer: its own hover, none beneath.
+            let hover = p.hit(px, py);
+            if hover != p.hover || self.hover_row.is_some() || self.hover_btn.is_some() {
+                p.hover = hover;
+                self.hover_row = None;
+                self.hover_btn = None;
                 *needs_rebuild = true;
             }
             return;
@@ -1444,6 +1586,25 @@ impl Application for CalendarApp {
             }
             return None;
         }
+        // The open picker takes every press: on it, a pick; anywhere else,
+        // it closes and the press goes no further.
+        if self.picker.is_some() {
+            if state == ElementState::Pressed {
+                let hit = self.picker.as_ref().and_then(|(p, _, _)| p.hit(px, py));
+                let today = self.today;
+                let outcome = match hit {
+                    Some(hit) if button == MouseButton::Left => {
+                        self.picker.as_mut().map_or(PickOutcome::Ignored, |(p, _, _)| p.press(hit, today))
+                    }
+                    Some(_) => PickOutcome::Ignored,
+                    None => PickOutcome::Close,
+                };
+                if self.apply_picker(outcome) {
+                    *needs_rebuild = true;
+                }
+            }
+            return None;
+        }
         // The Accounts menu first: its open list lies over the grid.
         let ev = WidgetEvent::MouseButton { button, state, x: px, y: py, local_x: px, local_y: py };
         if self.ui_context.propagate_event(&ev, self.accounts_menu.id()) {
@@ -1477,7 +1638,15 @@ impl Application for CalendarApp {
             self.select(date);
         } else if g.sidebar.contains(x, y) {
             let events = self.shown(self.selected).len();
-            match self.row_at(&g, x, y) {
+            let row = self.row_at(&g, x, y);
+            if let Some(i) = row.filter(|&i| Self::date_slot(self.sidebar_row(&g, i)).contains(x, y)) {
+                if self.row_target(i).is_some() {
+                    self.open_picker(i, &g);
+                    *needs_rebuild = true;
+                    return None;
+                }
+            }
+            match row {
                 Some(i) if i >= events => {
                     self.sel_event = None;
                     self.toggle_task(i - events);
@@ -1492,6 +1661,23 @@ impl Application for CalendarApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        if let Some((p, _, _)) = self.picker.as_mut() {
+            // Over the picker the wheel flips its months; elsewhere it
+            // closes it (the rows or the month are about to move).
+            if p.contains(pos.x, pos.y) {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y,
+                    MouseScrollDelta::PixelDelta(d) => d.y as f32,
+                };
+                if dy != 0.0 {
+                    p.shift_month(if dy < 0.0 { 1 } else { -1 });
+                    *needs_rebuild = true;
+                }
+                return;
+            }
+            self.picker = None;
+            *needs_rebuild = true;
+        }
         let g = self.geom();
         if g.sidebar.contains(pos.x, pos.y) {
             // A notch is one row, pixel deltas are 1:1. The motion glides
@@ -1545,6 +1731,17 @@ impl Application for CalendarApp {
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        // The open picker takes the keyboard.
+        if self.picker.is_some() {
+            if event.state == ElementState::Pressed {
+                let today = self.today;
+                let outcome = self.picker.as_mut().map_or(PickOutcome::Ignored, |(p, _, _)| p.key(event, today));
+                if self.apply_picker(outcome) {
+                    *needs_rebuild = true;
+                }
+            }
+            return None;
+        }
         // The Accounts menu takes keys while open, or while Tab has focused
         // it (Enter / Space opens it) and nothing is being typed; otherwise
         // they are the calendar's.
@@ -1599,6 +1796,9 @@ impl Application for CalendarApp {
         self.paint_sidebar(&mut pc, &g);
         if open {
             self.ui_context[self.accounts_menu].render_popover(&mut pc);
+        }
+        if let Some((p, _, _)) = &self.picker {
+            p.paint(&mut pc, self.today);
         }
         Some(pc.finish())
     }

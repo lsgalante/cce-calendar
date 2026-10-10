@@ -41,6 +41,9 @@
 //! a date picker that moves the row to another day — a task's date in its
 //! note, an event's in events.json (which the sync then moves upstream). A
 //! repeating event's instance cannot be moved, as it cannot be deleted.
+//! The same moves work by drag and drop: an event or task, from its grid
+//! chip or its day-pane row, dropped on another day (Escape cancels). A
+//! task row ticks on release, so a press that becomes a drag does not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -140,13 +143,40 @@ const NO_ROW: usize = 999;
 /// The calendar glyph's slot at a day-pane row's right end.
 const CAL_S: f32 = 18.0;
 
-/// What an open date picker moves.
+/// What an open date picker, or a drag, moves.
 #[derive(Clone, Debug)]
 enum PickTarget {
     /// The event at `idx` in `events[day]`.
     Event { day: NaiveDate, idx: usize },
     /// The vault task on `line` of `path`.
     Task { path: String, line: usize },
+}
+
+/// What a grid chip stands for: the `i`th of the day's shown events, or of
+/// its tasks.
+#[derive(Clone, Copy, Debug)]
+enum Chip {
+    Event(usize),
+    Task(usize),
+}
+
+/// How far the pointer travels before a press on an item becomes a drag.
+const DRAG_SLOP: f32 = 5.0;
+
+/// A press on an event or task that may become a drag.
+struct Drag {
+    /// `None` for a repeating instance, which cannot move but still ticks
+    /// or selects as a press.
+    target: Option<PickTarget>,
+    title: String,
+    task: bool,
+    from: NaiveDate,
+    start: (f32, f32),
+    at: (f32, f32),
+    /// Past `DRAG_SLOP`: the label follows the pointer.
+    active: bool,
+    /// The day-pane task to tick when the press ends without a drag.
+    tick: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -464,6 +494,12 @@ impl Geom {
         self.grid.y + GRID_LINE_W / 2.0 + row as f32 * self.cell_h
     }
 
+    /// The face of `date`'s cell (it may lie outside the shown weeks).
+    fn cell_of(&self, date: NaiveDate) -> Rect {
+        let i = (date - self.first_day).num_days().clamp(0, 41) as u64;
+        self.cell(i / 7, i % 7)
+    }
+
     /// A cell's face: the pitch box less half a line on every side — the
     /// rounded pocket the grout leaves.
     fn cell(&self, row: u64, col: u64) -> Rect {
@@ -506,6 +542,8 @@ struct CalendarApp {
     vault: Option<VaultTasks>,
     /// The open date picker, what it moves, and that thing's day-pane row.
     picker: Option<(DatePicker, PickTarget, usize)>,
+    /// A press on an item, and the drag it may have become.
+    drag: Option<Drag>,
     /// Displayed (year, month).
     view: (i32, u32),
     selected: NaiveDate,
@@ -765,10 +803,17 @@ impl CalendarApp {
             PickOutcome::Clear => None,
         };
         let Some((_, target, _)) = self.picker.take() else { return true };
+        self.move_target(target, date);
+        true
+    }
+
+    /// Move an event or task to `to` and follow it there; `None` undates a
+    /// task (an event keeps its day). The picker's and a drop's one path.
+    fn move_target(&mut self, target: PickTarget, to: Option<NaiveDate>) {
         match target {
             PickTarget::Event { day, idx } => {
-                let Some(to) = date.filter(|&d| d != day) else { return true };
-                let Some(list) = self.events.get_mut(&day).filter(|l| idx < l.len()) else { return true };
+                let Some(to) = to.filter(|&d| d != day) else { return };
+                let Some(list) = self.events.get_mut(&day).filter(|l| idx < l.len()) else { return };
                 let event = list.remove(idx);
                 if list.is_empty() {
                     self.events.remove(&day);
@@ -780,14 +825,72 @@ impl CalendarApp {
             }
             PickTarget::Task { path, line } => {
                 if let Some(v) = self.vault.as_mut() {
-                    self.status = v.set_due(&path, line, date).err().map(|e| format!("{path}: {e}"));
+                    self.status = v.set_due(&path, line, to).err().map(|e| format!("{path}: {e}"));
                 }
             }
         }
-        if let Some(d) = date {
+        if let Some(d) = to {
             self.select(d);
         }
-        true
+    }
+
+    /// The chips a grid cell shows, top to bottom, each with its line's
+    /// rect, and how many did not fit (the "+N more" line). Shared by the
+    /// paint and the drag's hit test.
+    fn cell_chips(&self, date: NaiveDate, cell: Rect) -> (Vec<(Rect, Chip)>, usize) {
+        // style: deliberate — a cell's chips are typographic lines under
+        // the day number, not ladder spacings.
+        let line_h = 15.0;
+        let events = self.shown(date).len();
+        let total = events + self.tasks(date).len();
+        let avail = ((cell.height - 26.0) / line_h).max(0.0) as usize;
+        let fit = if avail >= total { total } else { avail.saturating_sub(1) };
+        let chips = (0..fit)
+            .map(|k| {
+                let rect = Rect { x: cell.x + 4.0, y: cell.y + 24.0 + k as f32 * line_h, width: (cell.width - 8.0).max(0.0), height: line_h };
+                (rect, if k < events { Chip::Event(k) } else { Chip::Task(k - events) })
+            })
+            .collect();
+        (chips, total - fit)
+    }
+
+    /// What chip `chip` of `date` would move, its title, and whether it is
+    /// a task. A repeating instance has no target.
+    fn chip_target(&self, date: NaiveDate, chip: Chip) -> Option<(Option<PickTarget>, String, bool)> {
+        match chip {
+            Chip::Event(i) => {
+                let (idx, e) = self.shown(date).get(i).map(|(idx, e)| (*idx, *e))?;
+                let target = (!e.recurring).then_some(PickTarget::Event { day: date, idx });
+                Some((target, e.title.clone(), false))
+            }
+            Chip::Task(j) => {
+                let t = self.tasks(date).get(j)?;
+                Some((Some(PickTarget::Task { path: t.path.clone(), line: t.line }), t.text.clone(), true))
+            }
+        }
+    }
+
+    /// The day a drop at the drag's pointer would land on, while dragging.
+    fn drop_day(&self, g: &Geom) -> Option<NaiveDate> {
+        let d = self.drag.as_ref().filter(|d| d.active && d.target.is_some())?;
+        self.day_at(g, d.at.0, d.at.1)
+    }
+
+    /// The dragged item's label at the pointer: its marker and title on a
+    /// small plate of the cell face's colour.
+    fn paint_drag(&self, pc: &mut PaintCtx) {
+        let Some(d) = self.drag.as_ref().filter(|d| d.active && d.target.is_some()) else { return };
+        // style: deliberate — a pointer-attached label's own insets.
+        let w = (shaped_width(&d.title, 11.0, &list_font()) + 26.0).min(240.0);
+        let r = Rect { x: d.at.0 + 10.0, y: d.at.1 + 6.0, width: w, height: 20.0 };
+        pc.rounded_rect(r, 6.0, (true, true, true, true), [ACCENT[0], ACCENT[1], ACCENT[2], 0.85]);
+        if d.task {
+            pc.arc(r.x + 10.0, r.y + 10.0, 2.6, 1.2, 0.0, std::f32::consts::TAU, [1.0; 4]);
+        } else {
+            pc.circle(r.x + 10.0, r.y + 10.0, 2.5, [1.0; 4]);
+        }
+        pc.text_with(d.title.clone(), r.x + 18.0, r.y + 3.0, 11.0, [255, 255, 255], None,
+            Some([r.x, r.y, r.x + r.width - 4.0, r.y + r.height]));
     }
 
     /// An event's dot: its account's colour, or amber for a local one.
@@ -926,6 +1029,7 @@ impl CalendarApp {
     fn reload(&mut self) {
         // The rows may have moved under it.
         self.picker = None;
+        self.drag = None;
         self.events = load_events();
         self.source_colors = source_colors(&self.events, &self.account_colors);
         self.file_mtime = file_mtime();
@@ -1076,6 +1180,7 @@ impl CalendarApp {
     }
 
     fn paint_grid(&self, pc: &mut PaintCtx, g: &Geom) {
+        let drop = self.drop_day(g);
         for (i, name) in WEEKDAYS.iter().cycle()
             .skip(self.week_start.num_days_from_monday() as usize)
             .take(7)
@@ -1126,33 +1231,39 @@ impl CalendarApp {
             pc.text_boxed(date.day().to_string(), num.x, num.y, 11.5, num_color, None, None,
                 TextAttrs { italic: false, weight: Some(600), ..Default::default() }, Self::boxed(num, AlignH::Center));
 
+            // The day a drag would drop on: the selection ring, brighter.
+            if drop == Some(date) {
+                pc.border(cell, (radius, radius, radius, radius), [0.0; 4], ACCENT, 2.5);
+            }
+
             // Chips — events (a dot), then vault tasks (a ring) — each a
             // marker and a clipped title, then a "+N" overflow line.
-            let events = self.shown(date);
-            let tasks = self.tasks(date);
-            let total = events.len() + tasks.len();
-            if total > 0 {
-                let line_h = 15.0;
-                let avail = ((cell.height - 26.0) / line_h).max(0.0) as usize;
-                let shown = if avail >= total { total } else { avail.saturating_sub(1) };
+            let (chips, hidden) = self.cell_chips(date, cell);
+            if !chips.is_empty() || hidden > 0 {
+                let events = self.shown(date);
+                let tasks = self.tasks(date);
                 let clip = Some([cell.x, cell.y, cell.x + cell.width - 4.0, cell.y + cell.height]);
                 let text = if in_month { TEXT } else { TEXT_DIM };
                 pc.clip(cell, |pc| {
-                    let mut y = cell.y + 24.0;
-                    for (_, e) in events.iter().take(shown) {
-                        pc.circle(cell.x + 9.0, y + 6.0, 2.5, self.dot_color(e));
-                        pc.text_with(e.title.clone(), cell.x + 15.0, y, 10.0, text, None, clip);
-                        y += line_h;
+                    for (r, chip) in &chips {
+                        let (mx, my) = (r.x + 5.0, r.y + 6.0);
+                        match *chip {
+                            Chip::Event(i) => {
+                                let e = events[i].1;
+                                pc.circle(mx, my, 2.5, self.dot_color(e));
+                                pc.text_with(e.title.clone(), r.x + 11.0, r.y, 10.0, text, None, clip);
+                            }
+                            Chip::Task(j) => {
+                                let t = &tasks[j];
+                                let (ring, color) = if t.done { (TASK_RING_DONE, TEXT_FAINT) } else { (TASK_RING, text) };
+                                pc.arc(mx, my, 2.6, 1.2, 0.0, std::f32::consts::TAU, ring);
+                                pc.text_with(t.text.clone(), r.x + 11.0, r.y, 10.0, color, None, clip);
+                            }
+                        }
                     }
-                    for t in tasks.iter().take(shown.saturating_sub(events.len())) {
-                        let (ring, color) = if t.done { (TASK_RING_DONE, TEXT_FAINT) } else { (TASK_RING, text) };
-                        pc.arc(cell.x + 9.0, y + 6.0, 2.6, 1.2, 0.0, std::f32::consts::TAU, ring);
-                        pc.text_with(t.text.clone(), cell.x + 15.0, y, 10.0, color, None, clip);
-                        y += line_h;
-                    }
-                    if total > shown {
-                        pc.text_with(format!("+{} more", total - shown), cell.x + 15.0, y,
-                            10.0, TEXT_FAINT, None, None);
+                    if hidden > 0 {
+                        let y = chips.last().map_or(cell.y + 24.0, |(r, _)| r.y + r.height);
+                        pc.text_with(format!("+{hidden} more"), cell.x + 15.0, y, 10.0, TEXT_FAINT, None, None);
                     }
                 });
             }
@@ -1454,6 +1565,7 @@ impl Application for CalendarApp {
             accounts_menu,
             vault: VaultTasks::open(),
             picker: None,
+            drag: None,
             view: (today.year(), today.month()),
             selected: today,
             sel_event: None,
@@ -1519,6 +1631,7 @@ impl Application for CalendarApp {
             }
             if self.vault.as_mut().is_some_and(VaultTasks::poll) {
                 self.picker = None;
+                self.drag = None;
                 *needs_rebuild = true;
             }
         }
@@ -1548,6 +1661,19 @@ impl Application for CalendarApp {
                 *needs_rebuild = true;
             }
             return;
+        }
+        if let Some(d) = self.drag.as_mut() {
+            // A held press on an item: past the slop it is a drag, and the
+            // label and the drop day follow the pointer.
+            d.at = (px, py);
+            if !d.active && (px - d.start.0).hypot(py - d.start.1) > DRAG_SLOP {
+                d.active = true;
+                self.hover_row = None;
+            }
+            if d.active {
+                *needs_rebuild = true;
+                return;
+            }
         }
         let ev = WidgetEvent::PointerMove { x: px, y: py, local_x: px, local_y: py };
         if self.ui_context.propagate_event(&ev, self.accounts_menu.id()) {
@@ -1622,8 +1748,24 @@ impl Application for CalendarApp {
             if self.pressed_btn.take().is_some() {
                 *needs_rebuild = true;
             }
+            if let Some(d) = self.drag.take() {
+                let g = self.geom();
+                if d.active {
+                    // A drop on another day moves the item there.
+                    if let (Some(target), Some(to)) = (d.target, self.day_at(&g, pos.x, pos.y)) {
+                        if to != d.from {
+                            self.move_target(target, Some(to));
+                        }
+                    }
+                } else if let Some(j) = d.tick {
+                    // A press that never moved: the task row's click.
+                    self.toggle_task(j);
+                }
+                *needs_rebuild = true;
+            }
             return None;
         }
+        self.drag = None;
         let g = self.geom();
         let (x, y) = (pos.x, pos.y);
         let header_btn = Self::header_btn_at(&g, x, y);
@@ -1635,7 +1777,13 @@ impl Application for CalendarApp {
                 HeaderBtn::Today => self.select(self.today),
             }
         } else if let Some(date) = self.day_at(&g, x, y) {
+            // A press on a chip may become a drag of that item.
+            let chip = self.cell_chips(date, g.cell_of(date)).0.into_iter().find(|(r, _)| r.contains(x, y));
+            let press = chip.and_then(|(_, c)| self.chip_target(date, c));
             self.select(date);
+            if let Some((target, title, task)) = press {
+                self.drag = Some(Drag { target, title, task, from: date, start: (x, y), at: (x, y), active: false, tick: None });
+            }
         } else if g.sidebar.contains(x, y) {
             let events = self.shown(self.selected).len();
             let row = self.row_at(&g, x, y);
@@ -1646,12 +1794,20 @@ impl Application for CalendarApp {
                     return None;
                 }
             }
+            // A press on a row may become a drag of it; a task row's tick
+            // waits for the release, so a drag does not tick it.
+            let from = self.selected;
+            let press = row.and_then(|i| {
+                let chip = if i < events { Chip::Event(i) } else { Chip::Task(i - events) };
+                self.chip_target(from, chip).map(|(target, title, task)| (i, target, title, task))
+            });
             match row {
-                Some(i) if i >= events => {
-                    self.sel_event = None;
-                    self.toggle_task(i - events);
-                }
+                Some(i) if i >= events => self.sel_event = None,
                 row => self.sel_event = row,
+            }
+            if let Some((i, target, title, task)) = press {
+                let tick = (i >= events).then(|| i - events);
+                self.drag = Some(Drag { target, title, task, from, start: (x, y), at: (x, y), active: false, tick });
             }
         } else {
             return None;
@@ -1731,6 +1887,14 @@ impl Application for CalendarApp {
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        // Escape drops a drag where it started.
+        if self.drag.as_ref().is_some_and(|d| d.active) {
+            if event.state == ElementState::Pressed && event.logical_key == Key::Named(NamedKey::Escape) {
+                self.drag = None;
+                *needs_rebuild = true;
+            }
+            return None;
+        }
         // The open picker takes the keyboard.
         if self.picker.is_some() {
             if event.state == ElementState::Pressed {
@@ -1800,6 +1964,7 @@ impl Application for CalendarApp {
         if let Some((p, _, _)) = &self.picker {
             p.paint(&mut pc, self.today);
         }
+        self.paint_drag(&mut pc);
         Some(pc.finish())
     }
 

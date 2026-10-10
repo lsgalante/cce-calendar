@@ -1954,7 +1954,7 @@ impl Application for CalendarApp {
         pc.root_plate(size.width, size.height);
         self.paint_header(&mut pc, &g);
         if menu_rect.is_some() {
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.accounts_menu], &mut pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.accounts_menu], &mut pc);
         }
         self.paint_grid(&mut pc, &g);
         self.paint_sidebar(&mut pc, &g);

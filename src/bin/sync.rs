@@ -28,6 +28,9 @@
 //! one", so a deleted instance simply reappears. Guards: a missing
 //! events.json re-imports rather than deletes, and a run that would delete
 //! most tracked events (>5 and >50%) refuses without `--force-deletes`.
+//! Edits made to the file while a run talks to the servers (in the app, or
+//! by an agent through its MCP tools) are merged into what the run writes,
+//! not overwritten.
 //!
 //! CalDAV updates PATCH the fetched iCalendar (SUMMARY, DTSTART, DTEND)
 //! rather than rebuilding it, so alarms and Apple's own properties survive;
@@ -42,16 +45,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use cce_calendar::{
-    data_path, load_records, load_sync_state, push_target_config, read_accounts, save_records,
-    save_sync_state, sort_records, AccountOnDisk, EventRecord, PushTarget, SyncState, SyncedEvent,
+    data_path, load_records, load_sync_state, merge_concurrent, new_uid, push_target_config, read_accounts,
+    save_records, save_sync_state, sort_records, sync_window, AccountOnDisk, EventRecord, PushTarget,
+    SyncState, SyncedEvent,
 };
 use chrono::{DateTime, Days, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
 const CALDAV_ROOT: &str = "https://caldav.icloud.com/";
-/// Sync window around today. Wide enough forward that "next spring" plans
-/// show up; bounded so the file stays a glanceable flat list.
-const PAST_DAYS: u64 = 60;
-const FUTURE_DAYS: u64 = 400;
 /// An all-day event spanning more than this is almost certainly bad data
 /// (a botched DTEND); clamp rather than flood two months of cells.
 const MAX_ALLDAY_SPAN: u64 = 62;
@@ -80,10 +80,10 @@ fn main() {
     }
 
     let today = Local::now().date_naive();
-    let window = (
-        today.checked_sub_days(Days::new(PAST_DAYS)).unwrap_or(today),
-        today.checked_add_days(Days::new(FUTURE_DAYS)).unwrap_or(today),
-    );
+    // The sync window (cce_calendar::SYNC_PAST_DAYS / SYNC_FUTURE_DAYS):
+    // wide enough forward that "next spring" plans show up; bounded so the
+    // file stays a glanceable flat list.
+    let window = sync_window(today);
 
     // Typed events go to one calendar: on the named account, else the
     // first account of the configured kind.
@@ -103,6 +103,9 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // What the file held when we read it, to tell edits made while the
+    // servers were being talked to from the sync's own changes.
+    let original = records.clone();
     let mut state = match load_sync_state() {
         Ok(s) => s,
         Err(e) => {
@@ -147,6 +150,17 @@ fn main() {
     }
 
     if synced_any && !dry_run {
+        // The app (or an agent through its MCP tools) may have written the
+        // file since we read it. Re-read as late as possible and fold those
+        // edits in rather than writing over them.
+        match load_records() {
+            Ok(current) if current != original => {
+                log::info!("events.json changed during the sync; merging those edits");
+                records = merge_concurrent(&original, &current, records);
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("events.json unreadable before saving ({e}); writing the sync's result"),
+        }
         sort_records(&mut records);
         if let Err(e) = save_records(&records) {
             log::error!("saving events.json failed: {e}");
@@ -266,7 +280,7 @@ fn sync_source(
         records
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.source.is_none() && r.uid.is_none())
+            .filter(|(_, r)| r.source.is_none())
             .map(|(i, _)| i)
             .collect()
     } else {
@@ -342,6 +356,13 @@ fn sync_source(
     if let Some(t) = &target {
         for i in &push_creates {
             let local = &records[*i];
+            // Already on the server under the UID the app minted (a create
+            // whose result never reached the file): the mirror below
+            // replaces the local copy instead of creating a duplicate.
+            if local.uid.as_ref().is_some_and(|u| remote.events.contains_key(u)) {
+                consumed.insert(*i);
+                continue;
+            }
             match ops.create(t, local) {
                 Ok((uid, url, etag)) => {
                     state.events.insert(uid.clone(), synced(&source, &url, etag.clone(), local));
@@ -459,7 +480,9 @@ impl Ops<'_> {
     ) -> Result<(String, reqwest::Url, String), String> {
         match self.backend {
             Backend::ICloud(acc) => {
-                let uid = new_uid();
+                // The app mints a UID for every event it creates; older
+                // records typed before that carry none.
+                let uid = r.uid.clone().unwrap_or_else(new_uid);
                 let base = reqwest::Url::parse(&target.target).map_err(|e| e.to_string())?;
                 let url = base.join(&format!("{uid}.ics")).map_err(|e| e.to_string())?;
                 let etag = put_ics(self.client, acc, &url, &new_vevent(&uid, r)?, None)?;
@@ -1322,19 +1345,6 @@ fn patch_vevent(lines: &[String], r: &EventRecord) -> Result<String, String> {
     let mut s = out.join("\r\n");
     s.push_str("\r\n");
     Ok(s)
-}
-
-/// Random-enough UID from the kernel, no uuid dependency.
-fn new_uid() -> String {
-    let mut bytes = [0u8; 16];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
-        .is_err()
-    {
-        return format!("CCE-{}", Utc::now().format("%Y%m%dT%H%M%S%fZ"));
-    }
-    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
-    format!("CCE-{}-{}-{}", &hex[..8], &hex[8..16], &hex[16..])
 }
 
 // ── VEvent → records ──────────────────────────────────────────────────────

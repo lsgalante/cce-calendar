@@ -77,6 +77,77 @@ pub fn sort_records(records: &mut [EventRecord]) {
     });
 }
 
+/// Days before and after today the sync mirrors. An event outside the
+/// window stays on the server but drops out of events.json on the next run.
+pub const SYNC_PAST_DAYS: u64 = 60;
+pub const SYNC_FUTURE_DAYS: u64 = 400;
+
+pub fn sync_window(today: chrono::NaiveDate) -> (chrono::NaiveDate, chrono::NaiveDate) {
+    (
+        today.checked_sub_days(chrono::Days::new(SYNC_PAST_DAYS)).unwrap_or(today),
+        today.checked_add_days(chrono::Days::new(SYNC_FUTURE_DAYS)).unwrap_or(today),
+    )
+}
+
+/// Random-enough UID from the kernel, no uuid dependency. Minted by the app
+/// for every event created there, so an event has an identity before the
+/// sync pushes it; the sync reuses it as the iCalendar UID.
+pub fn new_uid() -> String {
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .is_err()
+    {
+        return format!("CCE-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S%fZ"));
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    format!("CCE-{}-{}-{}", &hex[..8], &hex[8..16], &hex[16..])
+}
+
+/// Fold edits made to events.json while the sync was running into the
+/// sync's result. The sync reads the file, talks to servers for seconds or
+/// minutes, then writes; without this, whatever the app wrote in between
+/// was lost (a new event dropped before it was ever pushed, a deletion
+/// undone).
+///
+/// `original` is what the sync read, `current` what the file holds now,
+/// `result` what the sync would write. Records in `original` but not
+/// `current` were removed meanwhile and are taken out of `result` — matched
+/// exactly, else by (uid, date), since the sync may have just replaced the
+/// record with a pushed or refreshed copy; records in `current` but not
+/// `original` were added and are put in. An edit is one of each.
+pub fn merge_concurrent(original: &[EventRecord], current: &[EventRecord], mut result: Vec<EventRecord>) -> Vec<EventRecord> {
+    let (removed, added) = multiset_diff(original, current);
+    for r in removed {
+        if let Some(i) = result.iter().position(|x| x == r) {
+            result.remove(i);
+        } else if let Some(uid) = &r.uid {
+            result.retain(|x| !(x.uid.as_ref() == Some(uid) && x.date == r.date));
+        }
+    }
+    for r in added {
+        if !result.contains(r) {
+            result.push(r.clone());
+        }
+    }
+    result
+}
+
+/// (in `a` but not `b`, in `b` but not `a`), counting duplicates.
+fn multiset_diff<'a>(a: &'a [EventRecord], b: &'a [EventRecord]) -> (Vec<&'a EventRecord>, Vec<&'a EventRecord>) {
+    let mut only_b: Vec<&EventRecord> = b.iter().collect();
+    let mut only_a = Vec::new();
+    for r in a {
+        match only_b.iter().position(|x| *x == r) {
+            Some(i) => {
+                only_b.swap_remove(i);
+            }
+            None => only_a.push(r),
+        }
+    }
+    (only_a, only_b)
+}
+
 // ── Sync state (cce-calendar-sync's merge base; the app never touches it) ─
 
 /// What the server held for one NON-recurring event at the end of the last
@@ -294,6 +365,54 @@ mod tests {
         assert!(!json.contains("recurring"));
         let rec = EventRecord { recurring: true, ..plain };
         assert!(serde_json::to_string(&rec).unwrap().contains("\"recurring\":true"));
+    }
+
+    fn rec(date: &str, title: &str, uid: Option<&str>, source: Option<&str>) -> EventRecord {
+        EventRecord {
+            date: date.into(),
+            time: None,
+            title: title.into(),
+            uid: uid.map(String::from),
+            source: source.map(String::from),
+            recurring: false,
+        }
+    }
+
+    #[test]
+    fn merge_keeps_an_event_added_during_the_sync() {
+        let original = vec![rec("2026-10-01", "a", Some("A"), Some("icloud:x"))];
+        let mut current = original.clone();
+        current.push(rec("2026-10-02", "typed", Some("T"), None));
+        // The sync refreshed A's title from the server.
+        let result = vec![rec("2026-10-01", "a2", Some("A"), Some("icloud:x"))];
+        let merged = merge_concurrent(&original, &current, result.clone());
+        assert_eq!(merged, vec![result[0].clone(), current[1].clone()]);
+    }
+
+    #[test]
+    fn merge_keeps_a_deletion_of_an_event_the_sync_just_pushed() {
+        let typed = rec("2026-10-02", "typed", Some("T"), None);
+        let original = vec![typed.clone()];
+        let current = vec![];
+        // The sync pushed it; the result holds the mirrored copy.
+        let result = vec![rec("2026-10-02", "typed", Some("T"), Some("icloud:x"))];
+        assert!(merge_concurrent(&original, &current, result).is_empty());
+    }
+
+    #[test]
+    fn merge_applies_an_edit_to_a_mirrored_event() {
+        let a = rec("2026-10-01", "a", Some("A"), Some("icloud:x"));
+        let moved = rec("2026-10-05", "a", Some("A"), Some("icloud:x"));
+        let other = rec("2026-10-03", "b", Some("B"), Some("icloud:x"));
+        let merged = merge_concurrent(&[a.clone()], &[moved.clone()], vec![a, other.clone()]);
+        assert_eq!(merged, vec![other, moved]);
+    }
+
+    #[test]
+    fn merge_counts_duplicates() {
+        let x = rec("2026-10-01", "x", None, None);
+        let merged = merge_concurrent(&[x.clone(), x.clone()], &[x.clone()], vec![x.clone(), x.clone()]);
+        assert_eq!(merged, vec![x]);
     }
 
     #[test]

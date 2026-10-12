@@ -25,6 +25,10 @@
 //! email, or `"google:me@gmail.com"` to tell one address's two accounts
 //! apart), otherwise accounts take a fixed palette in turn.
 //!
+//! Agents add, edit and delete events through MCP tools served by the
+//! running app (`mcp.rs`; port 3004), going through the same state and
+//! save as the window.
+//!
 //! The header's Accounts menu shows or hides each synced account's events
 //! (`hide-account "<kind>:<email>"` in the config — display only: they stay
 //! in events.json and keep syncing) and picks the account typed events go
@@ -50,7 +54,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cce_calendar::{
-    calendar_accounts, edit_config, load_records, push_target_config, save_push_target, save_records,
+    calendar_accounts, edit_config, load_records, new_uid, push_target_config, save_push_target, save_records,
     CalendarAccount, EventRecord, PushTarget,
 };
 use chrono::{Datelike, Days, Local, NaiveDate, Weekday};
@@ -179,9 +183,12 @@ struct Drag {
     tick: Option<usize>,
 }
 
+mod mcp;
+
 #[derive(Debug, Clone)]
 enum Message {
     Quit,
+    Mcp(cce_ui::mcp::McpToolCall),
 }
 
 /// One event on a day. `time` is (hour, minute); untimed events sort after
@@ -329,7 +336,9 @@ fn parse_event(raw: &str) -> Option<Event> {
         },
     };
     let title = if title.is_empty() { "(untitled)".to_string() } else { title };
-    Some(Event { time, title, uid: None, source: None, recurring: false })
+    // Minted here, not by the sync, so the event has an identity an agent
+    // can name before it is pushed.
+    Some(Event { time, title, uid: Some(new_uid()), source: None, recurring: false })
 }
 
 fn week_start_config() -> Weekday {
@@ -577,6 +586,9 @@ struct CalendarApp {
     /// frame after an idle sleep, and a calendar nobody is touching is idle —
     /// so the "once a second" watch actually ran about once a minute.
     watch_at: std::time::Instant,
+    /// When to start a sync run so an agent's edits reach the server now
+    /// rather than at the next timer tick; pushed back by each further edit.
+    sync_kick_at: Option<std::time::Instant>,
 }
 
 fn file_mtime() -> Option<std::time::SystemTime> {
@@ -1544,7 +1556,8 @@ impl Application for CalendarApp {
         Some(&mut self.ui_context)
     }
 
-    fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+    fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+        mcp::start(sender.into());
         let today = Local::now().date_naive();
         let events = load_events();
         let account_colors = account_colors_config();
@@ -1582,6 +1595,7 @@ impl Application for CalendarApp {
             hover_row: None,
             file_mtime: file_mtime(),
             watch_at: std::time::Instant::now(),
+            sync_kick_at: None,
         };
         app.refresh_accounts_menu();
         app
@@ -1598,9 +1612,13 @@ impl Application for CalendarApp {
         }
     }
 
-    fn update(&mut self, msg: Self::Message, _needs_rebuild: &mut bool, exit: &mut bool) {
+    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         match msg {
             Message::Quit => *exit = true,
+            Message::Mcp(call) => {
+                self.mcp_call(call);
+                *needs_rebuild = true;
+            }
         }
     }
 
@@ -1633,6 +1651,10 @@ impl Application for CalendarApp {
                 self.picker = None;
                 self.drag = None;
                 *needs_rebuild = true;
+            }
+            if self.sync_kick_at.is_some_and(|at| now_i >= at) {
+                self.sync_kick_at = None;
+                mcp::start_sync();
             }
         }
     }

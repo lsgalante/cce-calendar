@@ -17,8 +17,8 @@ When a user signs in with Google, the software may request access to:
 - Gmail (`https://mail.google.com/`) — to read and send that user's own mail
   over IMAP/SMTP in cce-mail.
 - Google Tasks — to read and update that user's own task lists in cce-list.
-- Google Calendar (read-only) — to display that user's own events in
-  cce-calendar.
+- Google Calendar — to display that user's own events in cce-calendar, and
+  to write back the events that user creates, changes or deletes there.
 - The account's email address — to label the account in the settings app.
 
 ## How data is used and stored

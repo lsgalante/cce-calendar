@@ -78,6 +78,8 @@ use cce_ui::widget::scroll_motion::{current_scroll_phase, Bounds, ScrollMotion, 
 use cce_ui::context::UiContext;
 use cce_ui::widget::context_menu::{self, MARK_CHECK, MARK_OFF, MARK_ON};
 use cce_ui::widget::Event as WidgetEvent;
+// The widgets' reports; `WidgetEvent` above is the input event type.
+use cce_ui::widget::WidgetEvent as UiEvent;
 use cce_ui::widget::input::date_picker::{DatePicker, Outcome as PickOutcome};
 use cce_ui::widget::{
     Adapted, Button, Checkbox, Dropdown, ElementState, Handle, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, Paint,
@@ -1005,11 +1007,18 @@ impl CalendarApp {
     /// After the Accounts menu took an event: act on a pick, and give the
     /// keyboard back to the calendar once the menu is closed — by a pick,
     /// Escape or a click — so Enter and the arrows are the calendar's again
-    /// rather than reopening the menu.
+    /// rather than reopening the menu. The pick comes out of the widget
+    /// sweep (`UiContext::take_events`); the menu is the only widget the
+    /// context holds.
     fn drain_accounts_menu(&mut self) {
-        if self.ui_context[self.accounts_menu].take_change() {
-            let row = self.ui_context[self.accounts_menu].selected;
-            self.accounts_menu_pick(row);
+        for (id, ev) in self.ui_context.take_events() {
+            match ev {
+                UiEvent::Changed if id == self.accounts_menu.id() => {
+                    let row = self.ui_context[self.accounts_menu].selected;
+                    self.accounts_menu_pick(row);
+                }
+                _ => {}
+            }
         }
         if !self.ui_context[self.accounts_menu].is_expanded() {
             self.ui_context.unfocus_id(self.accounts_menu.id());

@@ -14,7 +14,9 @@
 //!
 //! Keys: arrows move the selected day · PageUp/PageDown month · [/] year ·
 //! t/Home today · n/Enter new event (a leading `HH:MM` token sets the
-//! time) · d/Delete remove the clicked event · q quit. The wheel flips
+//! time) · d/Delete remove the clicked event · o open the clicked event's
+//! note in cce-notes (made as `Meetings/<date> <title>.md` the first time,
+//! found again by its `event:` property, `cce_vault::events`) · q quit. The wheel flips
 //! months over the grid and scrolls the event list over the pane.
 //!
 //! Config (`~/.config/cce/cce-calendar/config.kdl`): `week-start "sunday"`
@@ -1097,6 +1099,42 @@ impl CalendarApp {
         }
     }
 
+    /// Open the clicked event's note in cce-notes, making it first if it
+    /// has none. The note holds the event's id (`<source>/<uid>`), so an
+    /// event must have synced once (until then it has no id to hold).
+    fn open_event_note(&mut self) {
+        let Some(shown) = self.sel_event else {
+            self.status = Some("click an event first".to_string());
+            return;
+        };
+        let Some(ev) = self.shown(self.selected).get(shown).map(|(_, e)| (*e).clone()) else { return };
+        let Some(uid) = ev.uid.clone() else {
+            self.status = Some("this event has not synced yet — try after the next sync".to_string());
+            return;
+        };
+        let id = format!("{}/{uid}", ev.source.as_deref().unwrap_or("local"));
+        let Some(v) = self.vault.as_mut() else {
+            self.status = Some("no notes vault (vault { path } in config.kdl)".to_string());
+            return;
+        };
+        let path = match cce_vault::events::note_for(&v.index, &id) {
+            Some(p) => p,
+            None => {
+                let time = ev.time.map(|(h, m)| format!("{h:02}:{m:02}"));
+                match cce_vault::events::create_note(&mut v.index, &id, self.selected, &ev.title, time.as_deref()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.status = Some(format!("note: {e}"));
+                        return;
+                    }
+                }
+            }
+        };
+        let root = v.index.root().to_path_buf();
+        cce_vault::notes_ipc::open(&root.join(&path), Some(&root), |e| log::warn!("cce-notes: {e}"));
+        self.status = Some(format!("opened {path}"));
+    }
+
     // ── keyboard ──────────────────────────────────────────────────────────
 
     fn key_input_mode(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) {
@@ -1133,6 +1171,7 @@ impl CalendarApp {
                 "t" => self.select(self.today),
                 "n" => self.input = Some(String::new()),
                 "d" | "x" => self.delete_selected_event(),
+                "o" => self.open_event_note(),
                 "[" => self.shift_months(-12),
                 "]" => self.shift_months(12),
                 "q" => quit = true,
@@ -1504,7 +1543,7 @@ type Hint = (&'static [&'static str], &'static str);
 /// The strip's hints, most useful first: what does not fit is dropped whole.
 /// "today" comes last because the header's Today button already says it.
 const HINTS: [Hint; 3] = [(&["n"], "new"), (&["pgup", "pgdn"], "month"), (&["t"], "today")];
-const HINTS_SELECTED: [Hint; 3] = [(&["d"], "delete"), (&["n"], "new"), (&["t"], "today")];
+const HINTS_SELECTED: [Hint; 4] = [(&["o"], "note"), (&["d"], "delete"), (&["n"], "new"), (&["t"], "today")];
 
 impl CalendarApp {
     /// The key hints, or the status message in their place, in the status

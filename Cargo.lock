@@ -318,7 +318,7 @@ dependencies = [
 [[package]]
 name = "cce-vault"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-vault.git?rev=ad23009f1b8e50b93562c2ec1df178918eb60d5f#ad23009f1b8e50b93562c2ec1df178918eb60d5f"
+source = "git+https://github.com/lsgalante/cce-vault.git?rev=5bec1038dc74780664463f072e759c002a8f1b24#5bec1038dc74780664463f072e759c002a8f1b24"
 dependencies = [
  "cce-core",
  "chrono",

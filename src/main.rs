@@ -34,7 +34,7 @@
 //! The header's Accounts menu shows or hides each synced account's events
 //! (`hide-account "<kind>:<email>"` in the config — display only: they stay
 //! in events.json and keep syncing) and picks the account typed events go
-//! to (it rewrites `push-to`).
+//! to (it rewrites `push-to`). Each account's rows wear its event dot.
 //!
 //! Dated tasks from the notes vault (any `- [ ] … 📅 2026-10-20` checkbox,
 //! or `due 2026-10-20`, in any note — cce-list's lists included) show on
@@ -389,15 +389,23 @@ fn account_colors_config() -> Vec<(String, [f32; 4])> {
         .collect()
 }
 
-/// The dot colour of every account that has events on file. A configured
-/// colour wins (an exact source over a bare email); the rest take
-/// `ACCOUNT_DOTS` in turn, so accounts stay distinct until the palette runs
-/// out and keep their colours while the set of accounts does not change.
+/// The dot colour of every synced account, and of every account that has
+/// events on file. A configured colour wins (an exact source over a bare
+/// email); the rest take `ACCOUNT_DOTS` in turn, so accounts stay distinct
+/// until the palette runs out and keep their colours while the set of
+/// accounts does not change.
 fn source_colors(
     events: &BTreeMap<NaiveDate, Vec<Event>>,
+    accounts: &[CalendarAccount],
     configured: &[(String, [f32; 4])],
 ) -> BTreeMap<String, [f32; 4]> {
-    let sources: BTreeSet<&str> = events.values().flatten().filter_map(|e| e.source.as_deref()).collect();
+    let synced: Vec<String> = accounts.iter().map(CalendarAccount::source).collect();
+    let sources: BTreeSet<&str> = events
+        .values()
+        .flatten()
+        .filter_map(|e| e.source.as_deref())
+        .chain(synced.iter().map(String::as_str))
+        .collect();
     let mut next = 0;
     sources
         .into_iter()
@@ -951,7 +959,8 @@ impl CalendarApp {
 
     /// The Accounts menu's rows, dispatched by index in
     /// `accounts_menu_pick`: a show/hide switch per account, a separator,
-    /// then the radio group for where typed events go.
+    /// then the radio group for where typed events go. Each account's rows
+    /// carry its dot colour (`accounts_swatches`).
     fn accounts_options(&self) -> Vec<String> {
         let mut rows: Vec<String> = self
             .accounts
@@ -968,6 +977,19 @@ impl CalendarApp {
             rows.push(format!("{}New events → {}", radio(default == Some(i)), account_label(a)));
         }
         rows.push(format!("{}New events → this computer only", radio(default.is_none())));
+        rows
+    }
+
+    /// The Accounts menu's swatches, row for row with `accounts_options`:
+    /// each account's event dot on its switch and its radio, local amber on
+    /// "this computer only".
+    fn accounts_swatches(&self) -> Vec<Option<[f32; 4]>> {
+        let dots: Vec<Option<[f32; 4]>> =
+            self.accounts.iter().map(|a| self.source_colors.get(&a.source()).copied()).collect();
+        let mut rows = dots.clone();
+        rows.push(None);
+        rows.extend(dots);
+        rows.push(Some(EVENT_DOT));
         rows
     }
 
@@ -1001,8 +1023,10 @@ impl CalendarApp {
 
     fn refresh_accounts_menu(&mut self) {
         let options = self.accounts_options();
+        let swatches = self.accounts_swatches();
         let menu = &mut self.ui_context[self.accounts_menu];
         menu.options = options;
+        menu.swatches = swatches;
         menu.selected = NO_ROW;
     }
 
@@ -1054,7 +1078,7 @@ impl CalendarApp {
         self.picker = None;
         self.drag = None;
         self.events = load_events();
-        self.source_colors = source_colors(&self.events, &self.account_colors);
+        self.source_colors = source_colors(&self.events, &self.accounts, &self.account_colors);
         self.file_mtime = file_mtime();
         let n = self.shown(self.selected).len();
         if self.sel_event.is_some_and(|i| i >= n) {
@@ -1616,7 +1640,7 @@ impl Application for CalendarApp {
         let mut ui_context = UiContext::new();
         let accounts_menu = ui_context.insert(Dropdown::new(Vec::new(), NO_ROW).with_custom_display_text("Accounts"));
         let mut app = Self {
-            source_colors: source_colors(&events, &account_colors),
+            source_colors: source_colors(&events, &accounts, &account_colors),
             events,
             account_colors,
             accounts,
@@ -2070,7 +2094,7 @@ mod tests {
             synced("google:c@gmail.com"),
             parse_event("local").unwrap(),
         ]);
-        let colors = source_colors(&events, &[]);
+        let colors = source_colors(&events, &[], &[]);
         assert_eq!(colors.len(), 3);
         // Sorted by source: google:b, google:c, icloud:a.
         assert_eq!(colors["google:b@gmail.com"], ACCOUNT_DOTS[0]);
@@ -2078,9 +2102,16 @@ mod tests {
         assert_eq!(colors["icloud:a@me.com"], ACCOUNT_DOTS[2]);
 
         let red = [1.0, 0.0, 0.0, 1.0];
-        let colors = source_colors(&events, &[("B@gmail.com".into(), red)]);
+        let colors = source_colors(&events, &[], &[("B@gmail.com".into(), red)]);
         assert_eq!(colors["google:b@gmail.com"], red);
         // A pinned account does not use up a palette slot.
         assert_eq!(colors["google:c@gmail.com"], ACCOUNT_DOTS[0]);
+
+        // A synced account with nothing on file still has a dot, for the
+        // Accounts menu, and takes its place in the sorted order.
+        let quiet = CalendarAccount { kind: "google", email: "a@gmail.com".into() };
+        let colors = source_colors(&events, &[quiet], &[]);
+        assert_eq!(colors["google:a@gmail.com"], ACCOUNT_DOTS[0]);
+        assert_eq!(colors["google:b@gmail.com"], ACCOUNT_DOTS[1]);
     }
 }

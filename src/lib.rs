@@ -404,14 +404,14 @@ mod tests {
         let a = rec("2026-10-01", "a", Some("A"), Some("icloud:x"));
         let moved = rec("2026-10-05", "a", Some("A"), Some("icloud:x"));
         let other = rec("2026-10-03", "b", Some("B"), Some("icloud:x"));
-        let merged = merge_concurrent(&[a.clone()], &[moved.clone()], vec![a, other.clone()]);
+        let merged = merge_concurrent(std::slice::from_ref(&a), std::slice::from_ref(&moved), vec![a.clone(), other.clone()]);
         assert_eq!(merged, vec![other, moved]);
     }
 
     #[test]
     fn merge_counts_duplicates() {
         let x = rec("2026-10-01", "x", None, None);
-        let merged = merge_concurrent(&[x.clone(), x.clone()], &[x.clone()], vec![x.clone(), x.clone()]);
+        let merged = merge_concurrent(&[x.clone(), x.clone()], std::slice::from_ref(&x), vec![x.clone(), x.clone()]);
         assert_eq!(merged, vec![x]);
     }
 

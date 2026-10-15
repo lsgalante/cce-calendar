@@ -19,11 +19,16 @@
 //! there changes id once. Instances of a repeating event, and the per-day
 //! records of an all-day event spanning several days, share one uid and
 //! are read-only here, as they are in the window.
+//!
+//! `server()` classes every tool for the cce-claude popup (reads run
+//! unasked, edits ask once, `delete_event` every time), carries the brief,
+//! and names the vault apps (cce-notes, cce-spreadsheet) a client should
+//! load beside it; `every_tool_is_classed` holds a new tool to that.
 
 use std::time::{Duration, Instant};
 
 use cce_calendar::{new_uid, sync_window};
-use cce_ui::mcp::{McpTool, McpToolCall};
+use cce_ui::mcp::{McpServer, McpTool, McpToolCall, ToolClass};
 use chrono::{Days, Local, NaiveDate};
 use serde_json::{json, Value};
 
@@ -36,9 +41,49 @@ const SYNC_DEBOUNCE: Duration = Duration::from_secs(3);
 /// The most events `list_events` returns.
 const LIST_CAP: usize = 500;
 
+/// What the model is told about the calendar when a client connects.
+const BRIEF: &str = "\
+cce-calendar is the user's calendar: the events of their iCloud and Google accounts, mirrored by \
+a sync, plus events made here. Call `context` first: it names the day selected in the window, \
+the month on show, and that day's events. Events are addressed by `id`; dates are YYYY-MM-DD, \
+times 24-hour HH:MM local, and an event has no end time. `list_events` searches a range. An \
+edit shows in the window at once and is pushed to its account a few seconds later. There is no \
+undo tool: take an edit back with `update_event`. `delete_event` deletes on the server too. \
+Repeating events are read-only. The user's notes and spreadsheets may be connected as well, \
+for the tasks and money that go with the schedule.";
+
 pub fn start(sender: calloop::channel::Sender<Message>) {
     let port = std::env::var("CCE_CALENDAR_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT);
-    cce_ui::mcp::start_mcp_server("cce-calendar", port, tools(), sender, Message::Mcp);
+    server().fixed_port(port).start(sender, Message::Mcp);
+}
+
+/// The server: the tools, what each does to the world, the brief, and the
+/// vault apps a client should load beside it.
+fn server() -> McpServer {
+    McpServer::new("cce-calendar", tools())
+        .instructions(BRIEF)
+        .companions(&["cce-notes", "cce-spreadsheet"])
+        .classify(ToolClass::Read, &["list_events", "calendars"])
+        .classify(ToolClass::Edit, &["add_event", "update_event", "show_day"])
+        // Pushed as a deletion to iCloud or Google: what the event carried
+        // there (invitees, its server id) does not come back with a re-add.
+        .classify(ToolClass::Outward, &["delete_event"])
+}
+
+/// The `context` summary for the selected day: one line per event, the
+/// one picked in the window marked.
+fn day_summary(date: NaiveDate, day: &[Event], picked: Option<usize>) -> String {
+    let mut lines = vec![format!("{} ({})", date, date.format("%A"))];
+    if day.is_empty() {
+        lines.push("no events".to_string());
+    }
+    for (i, e) in day.iter().enumerate() {
+        let when = e.time.map_or_else(|| "all day".to_string(), |(h, m)| format!("{h:02}:{m:02}"));
+        let id = e.uid.as_deref().unwrap_or("-");
+        let mark = if picked == Some(i) { ", selected" } else { "" };
+        lines.push(format!("{when}  {}  (id {id}{mark})", e.title));
+    }
+    lines.join("\n")
 }
 
 /// Start a sync run without waiting for it. A run already in progress
@@ -67,6 +112,7 @@ fn tools() -> Vec<McpTool> {
     let time = json!({ "type": ["string", "null"], "description": "Start time, 24-hour HH:MM (local time). Events have no end time; the sync creates timed events an hour long." });
     let id = json!({ "type": "string", "description": "The event's id, from list_events or add_event" });
     vec![
+        cce_ui::mcp::context_tool(),
         tool(
             "list_events",
             "Events from `from` to `to` inclusive (default: today through 30 days on), timed before untimed within a day. \
@@ -194,6 +240,7 @@ impl CalendarApp {
         }
         self.ensure_ids();
         match name {
+            cce_ui::mcp::CONTEXT_TOOL => Ok(self.mcp_context()),
             "list_events" => self.mcp_list(args),
             "add_event" => {
                 let date = date_arg(args, "date")?.ok_or("missing `date`")?;
@@ -256,6 +303,26 @@ impl CalendarApp {
             }
             _ => Err(format!("unknown tool `{name}`")),
         }
+    }
+
+    /// The `context` answer: the selected day and its events, the month on
+    /// show.
+    fn mcp_context(&self) -> Value {
+        let day = self.events.get(&self.selected).map(Vec::as_slice).unwrap_or_default();
+        let picked = self.sel_event.filter(|&i| i < day.len());
+        cce_ui::mcp::Context {
+            view: json!({
+                "selected_day": self.selected.to_string(),
+                "month": format!("{}-{:02}", self.view.0, self.view.1),
+                "today": self.today.to_string(),
+                "hidden_accounts": self.hidden.iter().collect::<Vec<_>>(),
+            }),
+            selection: picked.and_then(|i| day[i].uid.clone()).into_iter().collect(),
+            undo: Some("no undo tool: reverse an edit with update_event; a deleted event is gone from its server".into()),
+            summary: Some(day_summary(self.selected, day, picked)),
+            ..cce_ui::mcp::Context::new(concat!("cce-calendar ", env!("CARGO_PKG_VERSION")))
+        }
+        .into_result()
     }
 
     fn mcp_list(&self, args: &Value) -> Result<Value, String> {
@@ -346,5 +413,29 @@ impl CalendarApp {
             ));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(time: Option<(u32, u32)>, title: &str, uid: &str) -> Event {
+        Event { time, title: title.into(), uid: Some(uid.into()), source: None, recurring: false }
+    }
+
+    #[test]
+    fn the_day_summary_lists_each_event_by_id_and_marks_the_pick() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 16).unwrap();
+        let events = [event(Some((9, 5)), "Dentist", "u1"), event(None, "Rent due", "u2")];
+        let s = day_summary(day, &events, Some(1));
+        assert_eq!(s, "2026-10-16 (Friday)\n09:05  Dentist  (id u1)\nall day  Rent due  (id u2, selected)");
+        assert_eq!(day_summary(day, &[], None), "2026-10-16 (Friday)\nno events");
+    }
+
+    #[test]
+    fn every_tool_is_classed() {
+        // An unclassed tool makes the popup ask before every call.
+        assert!(server().unclassed().is_empty(), "classify these in server(): {:?}", server().unclassed());
     }
 }

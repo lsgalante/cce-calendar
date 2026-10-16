@@ -20,7 +20,7 @@
 //! records of an all-day event spanning several days, share one uid and
 //! are read-only here, as they are in the window.
 //!
-//! `server()` classes every tool for the cce-claude popup (reads run
+//! `server()` classes every tool for the cce-code-agent popup (reads run
 //! unasked, edits ask once, `delete_event` every time), carries the brief,
 //! and names the vault apps (cce-notes, cce-spreadsheet) a client should
 //! load beside it; `every_tool_is_classed` holds a new tool to that.

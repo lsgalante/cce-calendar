@@ -17,7 +17,8 @@
 //! time) · d/Delete remove the clicked event · o open the clicked event's
 //! note in cce-notes (made as `Meetings/<date> <title>.md` the first time,
 //! found again by its `event:` property, `cce_vault::events`) · q quit. The wheel flips
-//! months over the grid and scrolls the event list over the pane.
+//! months over the grid and scrolls the event list over the pane. A launch
+//! opens on the day selected when it last closed (`ui_state`), not today.
 //!
 //! Config (`~/.config/cce/cce-calendar/config.kdl`): `week-start "sunday"`
 //! (default monday); `push-to "icloud"` / `"google"` / `"none"`, optionally
@@ -188,6 +189,7 @@ struct Drag {
 }
 
 mod mcp;
+mod ui_state;
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -729,6 +731,7 @@ impl CalendarApp {
         if (date.year(), date.month()) != self.view {
             self.view = (date.year(), date.month());
         }
+        ui_state::save(date);
     }
 
     /// How far the selected day's event rows overflow the sidebar's list area.
@@ -759,6 +762,7 @@ impl CalendarApp {
             self.selected = d;
             self.sel_event = None;
         }
+        ui_state::save(self.selected);
     }
 
     fn shift_selected_days(&mut self, delta: i64) {
@@ -1631,6 +1635,8 @@ impl Application for CalendarApp {
     fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
         mcp::start(sender.into());
         let today = Local::now().date_naive();
+        // Back on the day it was showing when it closed (`ui_state`).
+        let selected = ui_state::initial().unwrap_or(today);
         let events = load_events();
         let account_colors = account_colors_config();
         let accounts = calendar_accounts().unwrap_or_else(|e| {
@@ -1651,8 +1657,8 @@ impl Application for CalendarApp {
             vault: VaultTasks::open(),
             picker: None,
             drag: None,
-            view: (today.year(), today.month()),
-            selected: today,
+            view: (selected.year(), selected.month()),
+            selected,
             sel_event: None,
             input: None,
             week_start: week_start_config(),
